@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>weBIGeo Tiles Server</title>
+  <link rel="icon"
+    href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'><text y='25' font-size='27'>🧩</text></svg>">
+  <script>
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    document.documentElement.setAttribute('data-bs-theme', mq.matches ? 'dark' : 'light');
+    mq.addEventListener('change', e => document.documentElement.setAttribute('data-bs-theme', e.matches ? 'dark' : 'light'));
+  </script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootswatch@5.3.3/dist/flatly/bootstrap.min.css">
+  <style>
+    .status-dot {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      display: inline-block;
+      background: #6c757d;
+    }
+
+    .status-dot.idle {
+      background: #3fb950;
+      box-shadow: 0 0 6px #3fb950;
+    }
+
+    .status-dot.working {
+      background: #f0883e;
+      box-shadow: 0 0 6px #f0883e;
+      animation: pulse 1s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1
+      }
+
+      50% {
+        opacity: .35
+      }
+    }
+
+    .status-card {
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: .5rem;
+    }
+
+    .main-container {
+      max-width: 1000px;
+      min-height: 100vh;
+      background: rgba(0, 0, 0, 0.2);
+      border-left: 1px solid rgba(255, 255, 255, 0.4);
+      border-right: 1px solid rgba(255, 255, 255, 0.4);
+    }
+
+    @media (min-width: 1000px) {
+      .main-container {
+        padding-left: 50px;
+        padding-right: 50px;
+      }
+    }
+
+    /* Animated gradient background (https://codepen.io/P1N2O/pen/pyBNzX).
+       Slow when idle, fast (codepen speed) when the server is working. */
+    .bg-gradient-anim {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      background: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab);
+      background-size: 400% 400%;
+      animation: gradient 60s ease infinite;
+    }
+
+    .bg-gradient-anim.working {
+      animation-duration: 15s;
+    }
+
+    @keyframes gradient {
+      0% {
+        background-position: 0% 50%;
+      }
+
+      50% {
+        background-position: 100% 50%;
+      }
+
+      100% {
+        background-position: 0% 50%;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="bg-gradient-anim" aria-hidden="true"></div>
+  <div class="container py-4 main-container">
+
+    <!-- === HEADER === -->
+    <div class="d-flex align-items-center gap-2 mb-4 pb-3 border-bottom">
+      <span style="font-size:1.8rem">🧩</span>
+      <h1 class="fs-4 fw-semibold mb-0">weBIGeo Tiles Server</h1>
+      <span class="badge rounded-pill text-bg-primary ms-1" id="version-badge">…</span>
+    </div>
+
+    <!-- === STATUS === -->
+    <div class="status-card px-4 py-3 mb-4">
+      <div class="d-flex align-items-center gap-3">
+        <span class="status-dot" id="status-dot"></span>
+        <span class="fs-5 fw-semibold text-capitalize" id="status-label">connecting…</span>
+      </div>
+    </div>
+
+    <!-- === ABOUT === -->
+    <p class="text-secondary">Server that processes and serves geo tiles from various sources (e.g. weather stations)
+      for weather, snow, and other map overlays.</p>
+    <p class="text-secondary">This is currently a skeleton — it only exposes a status endpoint. Built for the
+      <a href="https://github.com/weBIGeo/webigeo">weBIGeo</a> web-based geographic visualization project.
+      You can see weBIGeo in action at <a href="https://webigeo.alpinemaps.org/">webigeo.alpinemaps.org</a>.
+    </p>
+
+    <div class="card mb-3 mt-4">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/status</code>
+        <code class="text-secondary" style="font-size:.8em">· /status</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Returns the server version and current status.</p>
+        <pre class="border rounded p-3 small mb-0"><code>{
+  "version": "0.1",
+  "status": "idle"
+}</code></pre>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const versionBadge = document.getElementById('version-badge');
+    const dot = document.getElementById('status-dot');
+    const label = document.getElementById('status-label');
+    const bg = document.querySelector('.bg-gradient-anim');
+
+    function applyStatus(data) {
+      dot.className = 'status-dot ' + data.status;
+      label.textContent = data.status;
+      bg.classList.toggle('working', data.status === 'working');
+      if (data.version) {
+        const v = 'v' + data.version;
+        versionBadge.textContent = v;
+        document.title = 'weBIGeo Tiles Server ' + v;
+      }
+    }
+
+    async function poll() {
+      try {
+        const data = await fetch('./status').then(r => r.json());
+        applyStatus(data);
+      } catch {
+        dot.className = 'status-dot';
+        label.textContent = 'unreachable';
+        bg.classList.remove('working');
+      }
+      setTimeout(poll, 2000);
+    }
+
+    poll();
+  </script>
+</body>
+
+</html>
