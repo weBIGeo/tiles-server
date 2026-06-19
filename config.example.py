@@ -54,3 +54,18 @@ smtp_password = ""
 # Install the ntfy app and subscribe to the same topic to receive push notifications.
 ntfy_topic  = "" # e.g. "webigeo-tiles-abc123"
 ntfy_server = "https://ntfy.sh"  # override for self-hosted instances
+
+# === exolabs / COSMOS snow data (used only by util/fetch_snow_cover.py) ===
+# Docs: https://exolabs-ch.gitbook.io/cosmos
+# WMS / XYZ tile access (pre-rendered visualization tiles).
+cosmos_wms_base     = "https://p20.cosmos-project.ch"
+cosmos_wms_user     = "YOUR_WMS_USER"
+cosmos_wms_password = "YOUR_WMS_PASSWORD"
+
+# S3 raw GeoTIFF access (raw daily snow-depth product, overwritten every day).
+# Credentials come from the AWS CSV exolabs handed over.
+cosmos_s3_bucket             = "exolabs-swiss-project"
+cosmos_s3_prefix             = "alps"
+cosmos_aws_access_key_id     = "YOUR_AWS_ACCESS_KEY_ID"
+cosmos_aws_secret_access_key = "YOUR_AWS_SECRET_ACCESS_KEY"
+cosmos_aws_region            = "eu-central-1"  # adjust if the bucket lives elsewhere
