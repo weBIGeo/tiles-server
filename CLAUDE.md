@@ -27,6 +27,12 @@ a new config value, add it to `config.example.py` with a comment, not just to `c
 
 There is no test suite, linter, or build step configured yet.
 
+**Do not run `python server.py` (or otherwise start/exercise the running server) yourself.**
+The user always runs and verifies the server themselves — this includes real
+downloads (e.g. S3) and long-running tile generation, which they want to watch and
+control directly. Static checks (`python -m py_compile ...`, reading logs the user
+shares) are fine; starting the process, hitting its endpoints, or killing it are not.
+
 ## Architecture
 
 - **server.py** — Flask app entrypoint. Registers `routes_v1.bp`, serves `docs/index.html`

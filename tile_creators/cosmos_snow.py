@@ -76,6 +76,12 @@ MAX_ZOOM = 13
 
 TILE_SIZE = 256
 
+# _save_tile() no longer commits on every call (that meant a disk sync per
+# tile - thousands of them per generation run); this is how many saved tiles
+# accumulate before a batch commit, bounding how much work an ungraceful
+# crash mid-run could lose.
+COMMIT_BATCH_SIZE = 500
+
 # Web Mercator (EPSG:3857) world half-extent in meters - used to convert an
 # XYZ tile index directly into its bounds in that CRS.
 WEBMERCATOR_ORIGIN = 20037508.342789244
@@ -192,6 +198,13 @@ def _open_db(date: str) -> sqlite3.Connection:
         os.makedirs(TILES_DIR, exist_ok=True)
         conn = sqlite3.connect(_db_path(date), check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        # WAL + NORMAL synchronous: SQLite's recommended pairing, durable
+        # against an application crash but not an OS crash/power loss for
+        # the most recent transaction - an acceptable tradeoff for
+        # regenerable tile cache data, and far fewer disk syncs than the
+        # default rollback-journal/FULL synchronous combo.
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS tiles (
                 z INTEGER NOT NULL,
@@ -230,12 +243,19 @@ def get_tile(date: str, z: int, x: int, y: int) -> bytes | None:
 
 
 def _save_tile(date: str, z: int, x: int, y: int, data: bytes) -> None:
+    """Queues the tile in the current transaction - does NOT commit. Callers
+    batch commits themselves via _commit() (see COMMIT_BATCH_SIZE)."""
     conn = _dbs[date]
     with _lock:
         conn.execute(
             "INSERT OR REPLACE INTO tiles (z, x, y, data) VALUES (?, ?, ?, ?)",
             (z, x, y, data),
         )
+
+
+def _commit(date: str) -> None:
+    conn = _dbs[date]
+    with _lock:
         conn.commit()
 
 
@@ -416,6 +436,7 @@ def _generate_for_date(date: str) -> None:
             (xmax - xmin + 1) * (ymax - ymin + 1) for xmin, xmax, ymin, ymax in zoom_ranges.values()
         )
         done = 0
+        since_commit = 0
         processes.update(key, done, total=total, message=f"{done}/{total} tiles generated")
 
         with rasterio.open(tif_path) as src:
@@ -432,8 +453,14 @@ def _generate_for_date(date: str) -> None:
                     if not _tile_exists(date, MAX_ZOOM, x, y):
                         value_cm, valid = _read_tile_from_raster(src, MAX_ZOOM, x, y)
                         _save_tile(date, MAX_ZOOM, x, y, _encode_tile(value_cm, valid))
+                        since_commit += 1
+                        if since_commit >= COMMIT_BATCH_SIZE:
+                            _commit(date)
+                            since_commit = 0
                     done += 1
                     processes.update(key, done, message=f"{done}/{total} tiles generated (z={MAX_ZOOM})")
+            _commit(date)  # flush the tail of this zoom level
+            since_commit = 0
 
         for z in range(MAX_ZOOM - 1, MIN_ZOOM - 1, -1):
             xmin, xmax, ymin, ymax = zoom_ranges[z]
@@ -446,14 +473,24 @@ def _generate_for_date(date: str) -> None:
                         }
                         value_cm, valid = _compose_parent_tile(children)
                         _save_tile(date, z, x, y, _encode_tile(value_cm, valid))
+                        since_commit += 1
+                        if since_commit >= COMMIT_BATCH_SIZE:
+                            _commit(date)
+                            since_commit = 0
                     done += 1
                     processes.update(key, done, message=f"{done}/{total} tiles generated (z={z})")
+            _commit(date)  # flush the tail of this zoom level
+            since_commit = 0
 
         elapsed = time.monotonic() - start
         processes.finish(key, message=f"{done} tiles in {elapsed:.1f}s")
         logger.info("cosmos-snow[%s]: dataset ready (%d tiles) in %.1fs", date, done, elapsed)
     except Exception:
         logger.exception("cosmos-snow[%s]: generation failed", date)
+        try:
+            _commit(date)  # persist whatever tiles succeeded before the failure
+        except Exception:
+            logger.exception("cosmos-snow[%s]: failed to flush partial progress after error", date)
         processes.fail(key, message="generation failed, check server log")
     finally:
         with _lock:
