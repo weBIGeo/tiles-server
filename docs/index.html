@@ -141,6 +141,34 @@
       </div>
     </div>
 
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/debug-ortho/status</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Readiness of the debug ortho tile dataset (see below). <code>generating</code>
+          while it's being downloaded/built in the background, <code>ready</code> once tiles can be served,
+          <code>error</code> if generation failed.</p>
+        <pre class="border rounded p-3 small mb-0"><code>{ "status": "ready" }</code></pre>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/debug-ortho/&lt;z&gt;/&lt;y&gt;/&lt;x&gt;.jpeg</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Self-generating debug dataset: real basemap.at orthofoto tiles
+          (zoom 0-20) for Vienna's 1st district, each labeled with its own z/x/y, plus artificial red-tinted
+          zoom-21 tiles over Stephansplatz (synthesized from the zoom-20 tiles). Path order matches
+          basemap.at's own WMTS layout (z/y/x). Returns <code>image/jpeg</code> on success,
+          <code>503</code> while the dataset is still generating, <code>404</code> for any tile outside the
+          covered area/zoom range.</p>
+      </div>
+    </div>
+
   </div>
 
   <script>

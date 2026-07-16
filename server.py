@@ -22,6 +22,7 @@ import config
 import log_config
 import util
 import db
+import debug_ortho
 import notify
 import routes_v1
 from flask import Flask, send_from_directory
@@ -53,6 +54,7 @@ if __name__ == "__main__":
     log_config.setup_logging(log_file=config.log_file)
     log_config.print_logo()
     db.init(config.db_path)
+    debug_ortho.init()
     msg = f" === weBIGeo Tiles Server v{VERSION} started === "
     sep = " " + "=" * (len(msg) - 2) + " "
     logger.info(sep)
@@ -60,5 +62,5 @@ if __name__ == "__main__":
     logger.info(sep)
     notify.notify("weBIGeo Tiles Server started", f"Server v{VERSION} started on {config.host}:{config.port}")
 
-    logger.info(f"Starting waitress server on http://{config.host}:{config.port}")
-    serve(app, host=config.host, port=config.port)
+    logger.info(f"Starting waitress server on http://{config.host}:{config.port} ({config.threads} threads)")
+    serve(app, host=config.host, port=config.port, threads=config.threads)
