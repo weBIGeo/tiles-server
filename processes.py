@@ -31,7 +31,8 @@ ERROR = "error"
 
 # How long a finished (done/error) process stays in list_all() after
 # completion, so the UI reverts to a clean state once nothing is happening.
-FINISHED_RETENTION_SECONDS = 30
+# 0 = vanish immediately on the next poll.
+FINISHED_RETENTION_SECONDS = 0
 
 _lock = threading.Lock()
 _processes: dict[str, dict] = {}

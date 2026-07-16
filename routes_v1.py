@@ -66,18 +66,32 @@ bp.add_url_rule("/debug-ortho/status", view_func=debug_ortho_status)
 bp.add_url_rule("/debug-ortho/<int:z>/<int:y>/<int:x>.jpeg", view_func=debug_ortho_tile)
 
 
-def cosmos_snow_status():
-    return jsonify({"status": cosmos_snow.get_status()})
+def cosmos_snow_dates():
+    return jsonify(cosmos_snow.list_dates())
 
 
-def cosmos_snow_tile(z: int, x: int, y: int):
-    data = cosmos_snow.get_tile(z, x, y)
+def cosmos_snow_generate(date: str):
+    try:
+        status = cosmos_snow.start_generation(date)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"date": date, "status": status})
+
+
+def cosmos_snow_status(date: str):
+    return jsonify({"status": cosmos_snow.get_status(date)})
+
+
+def cosmos_snow_tile(date: str, z: int, x: int, y: int):
+    data = cosmos_snow.get_tile(date, z, x, y)
     if data is not None:
         return Response(data, mimetype="image/png")
-    if not cosmos_snow.is_ready():
+    if not cosmos_snow.is_ready(date):
         return jsonify({"error": "cosmos snow tiles are still being generated"}), 503
     abort(404)
 
 
-bp.add_url_rule("/cosmos-snow/status", view_func=cosmos_snow_status)
-bp.add_url_rule("/cosmos-snow/<int:z>/<int:x>/<int:y>.png", view_func=cosmos_snow_tile)
+bp.add_url_rule("/cosmos-snow/dates", view_func=cosmos_snow_dates)
+bp.add_url_rule("/cosmos-snow/<date>/generate", view_func=cosmos_snow_generate, methods=["POST"])
+bp.add_url_rule("/cosmos-snow/<date>/status", view_func=cosmos_snow_status)
+bp.add_url_rule("/cosmos-snow/<date>/<int:z>/<int:x>/<int:y>.png", view_func=cosmos_snow_tile)

@@ -99,6 +99,8 @@
       <span class="fs-6 fw-semibold">weBIGeo Tiles Server</span>
     </a>
     <span class="text-secondary small ms-2">Debug ortho tiles</span>
+    <span class="text-secondary small ms-4 me-2">Snow date:</span>
+    <select id="snow-date-select" class="form-select form-select-sm" style="width:auto"></select>
   </nav>
 
   <div id="map"></div>
@@ -146,23 +148,15 @@
       attribution: 'Imagery &copy; <a href="https://basemap.at/">basemap.at</a> (weBIGeo debug dataset)',
     }).addTo(map);
 
-    // Raw R/G-encoded centimeter values (value_cm = R*256+G), not a colormap -
-    // renders as a reddish/greenish raster until a display transform is added.
-    const cosmosSnowLayer = L.tileLayer('./v1/cosmos-snow/{z}/{x}/{y}.png', {
-      tileSize: 256,
-      minZoom: 0,
-      maxZoom: 21,
-      minNativeZoom: 0,
-      maxNativeZoom: 13,
-      attribution: 'Snow depth &copy; exolabs / COSMOS (2026-01-01)',
-    }).addTo(map);
-
-    // All four are overlays (not mutually-exclusive base layers), listed here
-    // topmost-first. Order in this array IS the stacking order - the custom
-    // control below lets it be dragged to rearrange, since Leaflet's built-in
-    // layers control has no reordering support.
+    // COSMOS snow depth is date-selectable (see the dropdown in the navbar) -
+    // its layerEntries slot is added dynamically once the available dates are
+    // known, by selectSnowDate() further down.
+    //
+    // All entries are overlays (not mutually-exclusive base layers), listed
+    // here topmost-first. Order in this array IS the stacking order - the
+    // custom control below lets it be dragged to rearrange, since Leaflet's
+    // built-in layers control has no reordering support.
     const layerEntries = [
-      { name: 'COSMOS snow depth (2026-01-01)', layer: cosmosSnowLayer, active: true },
       { name: 'Debug ortho tiles', layer: debugOrthoLayer, active: true },
       { name: 'basemap.at (satellite)', layer: basemapAtOrthoLayer, active: true },
       { name: 'basemap.at', layer: basemapAtLayer, active: true },
@@ -247,7 +241,7 @@
       },
     });
 
-    new LayerOrderControl().addTo(map);
+    const layerOrderControl = new LayerOrderControl().addTo(map);
     applyLayerOrder();
 
     const banner = document.getElementById('status-banner');
@@ -275,33 +269,106 @@
       setTimeout(pollStatus, 3000);
     }
 
-    const bannerSnow = document.getElementById('status-banner-snow');
+    pollStatus();
 
-    async function pollCosmosSnowStatus() {
+    // === COSMOS SNOW: date-selectable layer ===
+    const snowDateSelect = document.getElementById('snow-date-select');
+    const bannerSnow = document.getElementById('status-banner-snow');
+    let cosmosSnowEntry = null; // layerEntries element for the snow layer, created on first date load
+    // Bumped on every date switch so a poll loop for a since-abandoned date
+    // stops updating the (now reassigned) banner/layer instead of racing the
+    // poll loop for the newly selected date.
+    let snowPollGeneration = 0;
+
+    // Raw R/G-encoded centimeter values (value_cm = R*256+G), not a colormap -
+    // renders as a reddish/greenish raster until a display transform is added.
+    function createCosmosSnowLayer(date) {
+      return L.tileLayer(`./v1/cosmos-snow/${date}/{z}/{x}/{y}.png`, {
+        tileSize: 256,
+        minZoom: 0,
+        maxZoom: 21,
+        minNativeZoom: 0,
+        maxNativeZoom: 13,
+        attribution: `Snow depth &copy; exolabs / COSMOS (${date})`,
+      });
+    }
+
+    function selectSnowDate(date) {
+      snowPollGeneration++;
+      const wasActive = cosmosSnowEntry ? cosmosSnowEntry.active : true;
+      if (cosmosSnowEntry && map.hasLayer(cosmosSnowEntry.layer)) {
+        map.removeLayer(cosmosSnowEntry.layer);
+      }
+      const layer = createCosmosSnowLayer(date);
+      if (cosmosSnowEntry) {
+        cosmosSnowEntry.layer = layer;
+        cosmosSnowEntry.name = `COSMOS snow depth (${date})`;
+      } else {
+        cosmosSnowEntry = { name: `COSMOS snow depth (${date})`, layer, active: true };
+        layerEntries.unshift(cosmosSnowEntry);
+      }
+      if (wasActive) {
+        map.addLayer(layer);
+      }
+      applyLayerOrder();
+      layerOrderControl._renderList();
+      bannerSnow.classList.add('d-none');
+      pollCosmosSnowStatus(date, snowPollGeneration);
+    }
+
+    async function pollCosmosSnowStatus(date, generation) {
+      if (generation !== snowPollGeneration) return; // a newer date was selected meanwhile
       try {
-        const { status } = await fetch('./v1/cosmos-snow/status').then(r => r.json());
+        const { status } = await fetch(`./v1/cosmos-snow/${date}/status`).then(r => r.json());
+        if (generation !== snowPollGeneration) return;
         if (status === 'ready') {
           if (!bannerSnow.classList.contains('d-none')) {
             bannerSnow.classList.add('d-none');
-            cosmosSnowLayer.redraw();
           }
+          cosmosSnowEntry.layer.redraw();
           return; // stop polling once ready
         }
         bannerSnow.classList.remove('d-none');
         bannerSnow.className = 'alert shadow status-banner ' + (status === 'error' ? 'alert-danger' : 'alert-warning');
         bannerSnow.textContent = status === 'error'
-          ? 'COSMOS snow depth tile generation failed — check the server log.'
-          : 'COSMOS snow depth tiles are still generating, some tiles may be missing…';
+          ? `COSMOS snow depth generation for ${date} failed — check the server log.`
+          : `COSMOS snow depth tiles for ${date} are still generating, some tiles may be missing…`;
       } catch {
+        if (generation !== snowPollGeneration) return;
         bannerSnow.classList.remove('d-none');
         bannerSnow.className = 'alert alert-danger shadow status-banner';
         bannerSnow.textContent = 'Could not reach the tiles server.';
       }
-      setTimeout(pollCosmosSnowStatus, 3000);
+      setTimeout(() => pollCosmosSnowStatus(date, generation), 3000);
     }
 
-    pollStatus();
-    pollCosmosSnowStatus();
+    async function loadSnowDates() {
+      try {
+        const dates = await fetch('./v1/cosmos-snow/dates').then(r => r.json());
+        snowDateSelect.innerHTML = '';
+        if (dates.length === 0) {
+          const opt = document.createElement('option');
+          opt.textContent = 'no dates generated yet';
+          opt.disabled = true;
+          snowDateSelect.appendChild(opt);
+          return;
+        }
+        for (const { date, status } of dates) {
+          const opt = document.createElement('option');
+          opt.value = date;
+          opt.textContent = status === 'ready' ? date : `${date} (${status})`;
+          snowDateSelect.appendChild(opt);
+        }
+        const latest = dates[dates.length - 1].date; // dates sort lexicographically = chronologically
+        snowDateSelect.value = latest;
+        selectSnowDate(latest);
+      } catch {
+        // leave the dropdown empty; user can retry by reloading the page
+      }
+    }
+
+    snowDateSelect.addEventListener('change', () => selectSnowDate(snowDateSelect.value));
+    loadSnowDates();
   </script>
 </body>
 

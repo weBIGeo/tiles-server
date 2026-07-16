@@ -197,6 +197,74 @@
       </div>
     </div>
 
+    <div class="card mb-3 mt-4">
+      <div class="card-header">COSMOS snow depth — generate a day</div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Snow depth tiles (exolabs/COSMOS, cropped to Lower Austria) are
+          generated on demand per day rather than on server startup. Pick a date and generate it here; progress
+          shows up in Background processes above, and the result appears as a selectable layer on the
+          <a href="./map">map</a> once ready.</p>
+        <form id="snow-generate-form" class="d-flex gap-2 align-items-center">
+          <input type="date" class="form-control" id="snow-date-input" style="max-width:200px" required>
+          <button type="submit" class="btn btn-primary btn-sm">Generate</button>
+        </form>
+        <div id="snow-generate-result" class="small text-secondary mt-2"></div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/cosmos-snow/dates</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Lists every date that has been generated or is currently
+          generating.</p>
+        <pre class="border rounded p-3 small mb-0"><code>[{ "date": "2026-01-01", "status": "ready" }]</code></pre>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-warning" style="font-size:.7rem;letter-spacing:.05em">POST</span>
+        <code>/v1/cosmos-snow/&lt;date&gt;/generate</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Starts background generation for <code>date</code>
+          (<code>YYYY-MM-DD</code>) if it isn't already ready or generating; otherwise a no-op that just
+          returns the current status. <code>400</code> for a malformed or future date.</p>
+        <pre class="border rounded p-3 small mb-0"><code>{ "date": "2026-01-02", "status": "generating" }</code></pre>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/cosmos-snow/&lt;date&gt;/status</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Readiness of one day's snow-depth dataset: <code>generating</code>,
+          <code>ready</code>, <code>error</code>, or <code>unknown</code> if that date was never requested.</p>
+        <pre class="border rounded p-3 small mb-0"><code>{ "status": "ready" }</code></pre>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/cosmos-snow/&lt;date&gt;/&lt;z&gt;/&lt;x&gt;/&lt;y&gt;.png</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Snow depth in centimeters, cropped to Lower Austria, zoom 0-13
+          (source resolution is 20m/px, z13 is the highest zoom that reflects real detail rather than
+          upsampling). Value encoding: <code>depth_cm = R*256 + G</code>, blue unused, alpha 0 (transparent)
+          wherever depth is 0 or the source pixel is nodata. Returns <code>image/png</code> on success,
+          <code>503</code> while that date is still generating, <code>404</code> for any tile outside the
+          covered area/zoom range.</p>
+        <a href="./map" class="btn btn-sm btn-outline-primary">🗺️ View these tiles on a map &rarr;</a>
+      </div>
+    </div>
+
   </div>
 
   <script>
@@ -271,6 +339,21 @@
     }
 
     pollProcesses();
+
+    // === COSMOS SNOW — GENERATE A DAY ===
+    document.getElementById('snow-generate-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const date = document.getElementById('snow-date-input').value;
+      const resultEl = document.getElementById('snow-generate-result');
+      resultEl.textContent = 'Starting…';
+      try {
+        const r = await fetch(`./v1/cosmos-snow/${date}/generate`, { method: 'POST' });
+        const data = await r.json();
+        resultEl.textContent = r.ok ? `Status: ${data.status}` : `Error: ${data.error}`;
+      } catch {
+        resultEl.textContent = 'Could not reach the server.';
+      }
+    });
   </script>
 </body>
 

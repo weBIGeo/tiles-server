@@ -43,9 +43,14 @@ log_file_backup_count = 3
 
 # Per-logger level overrides. Use this to silence noisy third-party libraries
 log_level_overrides = {
-    "waitress": "ERROR",
-    "filelock": "ERROR",
-    "urllib3":  "ERROR",
+    "waitress":   "ERROR",
+    "filelock":   "ERROR",
+    "urllib3":    "ERROR",
+    "PIL":        "WARNING",  # Pillow logs a STREAM line per PNG chunk at DEBUG
+    "rasterio":   "WARNING",  # GDAL debug logging (windowed reads, nodata, ...)
+    "boto3":      "WARNING",
+    "botocore":   "WARNING",
+    "s3transfer": "WARNING",  # logs a line per multipart-download chunk at DEBUG
 }
 
 # Email notifications. Leave smtp_host or notify_email empty/None to disable.
