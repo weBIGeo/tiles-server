@@ -148,6 +148,45 @@
       attribution: 'Imagery &copy; <a href="https://basemap.at/">basemap.at</a> (weBIGeo debug dataset)',
     }).addTo(map);
 
+    // Synthetic overlay (no server round-trip - drawn client-side per tile)
+    // showing each tile's z/x/y and a border, useful when debugging any
+    // layer's tiling regardless of what that layer actually renders.
+    const TileGridDebugLayer = L.GridLayer.extend({
+      createTile: function (coords) {
+        const tile = document.createElement('canvas');
+        const size = this.getTileSize();
+        tile.width = size.x;
+        tile.height = size.y;
+        const ctx = tile.getContext('2d');
+
+        ctx.strokeStyle = 'rgba(255,0,0,.6)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0.5, 0.5, size.x - 1, size.y - 1);
+
+        const zLabel = `z${coords.z}`;
+        const xyLabel = `x${coords.x} y${coords.y}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = 'bold 20px sans-serif';
+        const zWidth = ctx.measureText(zLabel).width;
+        ctx.font = '12px sans-serif';
+        const xyWidth = ctx.measureText(xyLabel).width;
+        const boxW = Math.max(zWidth, xyWidth) + 12;
+        const boxH = 40;
+        ctx.fillStyle = 'rgba(0,0,0,.55)';
+        ctx.fillRect(size.x / 2 - boxW / 2, size.y / 2 - boxH / 2, boxW, boxH);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 20px sans-serif';
+        ctx.fillText(zLabel, size.x / 2, size.y / 2 - 10);
+        ctx.font = '12px sans-serif';
+        ctx.fillText(xyLabel, size.x / 2, size.y / 2 + 10);
+
+        return tile;
+      },
+    });
+    const tileGridDebugLayer = new TileGridDebugLayer({ tileSize: 256, minZoom: 0, maxZoom: 21 });
+
     // COSMOS snow depth is date-selectable (see the dropdown in the navbar) -
     // its layerEntries slot is added dynamically once the available dates are
     // known, by selectSnowDate() further down.
@@ -157,6 +196,7 @@
     // custom control below lets it be dragged to rearrange, since Leaflet's
     // built-in layers control has no reordering support.
     const layerEntries = [
+      { name: 'Tile grid/debug labels', layer: tileGridDebugLayer, active: false },
       { name: 'Debug ortho tiles', layer: debugOrthoLayer, active: true },
       { name: 'basemap.at (satellite)', layer: basemapAtOrthoLayer, active: true },
       { name: 'basemap.at', layer: basemapAtLayer, active: true },
