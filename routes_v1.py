@@ -18,7 +18,7 @@
 
 import processes
 import util
-from tile_creators import debug_ortho
+from tile_creators import cosmos_snow, debug_ortho
 from flask import Blueprint, Response, abort, jsonify
 
 bp = Blueprint("v1", __name__, url_prefix="/v1")
@@ -64,3 +64,20 @@ def debug_ortho_tile(z: int, y: int, x: int):
 
 bp.add_url_rule("/debug-ortho/status", view_func=debug_ortho_status)
 bp.add_url_rule("/debug-ortho/<int:z>/<int:y>/<int:x>.jpeg", view_func=debug_ortho_tile)
+
+
+def cosmos_snow_status():
+    return jsonify({"status": cosmos_snow.get_status()})
+
+
+def cosmos_snow_tile(z: int, x: int, y: int):
+    data = cosmos_snow.get_tile(z, x, y)
+    if data is not None:
+        return Response(data, mimetype="image/png")
+    if not cosmos_snow.is_ready():
+        return jsonify({"error": "cosmos snow tiles are still being generated"}), 503
+    abort(404)
+
+
+bp.add_url_rule("/cosmos-snow/status", view_func=cosmos_snow_status)
+bp.add_url_rule("/cosmos-snow/<int:z>/<int:x>/<int:y>.png", view_func=cosmos_snow_tile)

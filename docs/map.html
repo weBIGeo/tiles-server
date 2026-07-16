@@ -103,6 +103,7 @@
 
   <div id="map"></div>
   <div class="alert alert-warning shadow status-banner d-none" id="status-banner" role="alert"></div>
+  <div class="alert alert-warning shadow status-banner d-none" id="status-banner-snow" style="top:108px" role="alert"></div>
 
   <script>
     // Stephansplatz, matches debug_ortho.STEPHANSPLATZ_LAT/LON.
@@ -145,11 +146,23 @@
       attribution: 'Imagery &copy; <a href="https://basemap.at/">basemap.at</a> (weBIGeo debug dataset)',
     }).addTo(map);
 
+    // Raw R/G-encoded centimeter values (value_cm = R*256+G), not a colormap -
+    // renders as a reddish/greenish raster until a display transform is added.
+    const cosmosSnowLayer = L.tileLayer('./v1/cosmos-snow/{z}/{x}/{y}.png', {
+      tileSize: 256,
+      minZoom: 0,
+      maxZoom: 21,
+      minNativeZoom: 0,
+      maxNativeZoom: 13,
+      attribution: 'Snow depth &copy; exolabs / COSMOS (2026-01-01)',
+    }).addTo(map);
+
     // All four are overlays (not mutually-exclusive base layers), listed here
     // topmost-first. Order in this array IS the stacking order - the custom
     // control below lets it be dragged to rearrange, since Leaflet's built-in
     // layers control has no reordering support.
     const layerEntries = [
+      { name: 'COSMOS snow depth (2026-01-01)', layer: cosmosSnowLayer, active: true },
       { name: 'Debug ortho tiles', layer: debugOrthoLayer, active: true },
       { name: 'basemap.at (satellite)', layer: basemapAtOrthoLayer, active: true },
       { name: 'basemap.at', layer: basemapAtLayer, active: true },
@@ -262,7 +275,33 @@
       setTimeout(pollStatus, 3000);
     }
 
+    const bannerSnow = document.getElementById('status-banner-snow');
+
+    async function pollCosmosSnowStatus() {
+      try {
+        const { status } = await fetch('./v1/cosmos-snow/status').then(r => r.json());
+        if (status === 'ready') {
+          if (!bannerSnow.classList.contains('d-none')) {
+            bannerSnow.classList.add('d-none');
+            cosmosSnowLayer.redraw();
+          }
+          return; // stop polling once ready
+        }
+        bannerSnow.classList.remove('d-none');
+        bannerSnow.className = 'alert shadow status-banner ' + (status === 'error' ? 'alert-danger' : 'alert-warning');
+        bannerSnow.textContent = status === 'error'
+          ? 'COSMOS snow depth tile generation failed — check the server log.'
+          : 'COSMOS snow depth tiles are still generating, some tiles may be missing…';
+      } catch {
+        bannerSnow.classList.remove('d-none');
+        bannerSnow.className = 'alert alert-danger shadow status-banner';
+        bannerSnow.textContent = 'Could not reach the tiles server.';
+      }
+      setTimeout(pollCosmosSnowStatus, 3000);
+    }
+
     pollStatus();
+    pollCosmosSnowStatus();
   </script>
 </body>
 

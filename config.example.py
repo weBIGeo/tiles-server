@@ -61,15 +61,21 @@ smtp_password = ""
 ntfy_topic  = "" # e.g. "webigeo-tiles-abc123"
 ntfy_server = "https://ntfy.sh"  # override for self-hosted instances
 
-# === exolabs / COSMOS snow data (used only by util/fetch_snow_cover.py) ===
+# === exolabs / COSMOS snow data ===
+# Used by util/fetch_snow_cover.py (standalone exploration CLI) and by
+# tile_creators/cosmos_snow.py (the server's snow-depth tileset).
 # Docs: https://exolabs-ch.gitbook.io/cosmos
 # WMS / XYZ tile access (pre-rendered visualization tiles).
 cosmos_wms_base     = "https://p20.cosmos-project.ch"
 cosmos_wms_user     = "YOUR_WMS_USER"
 cosmos_wms_password = "YOUR_WMS_PASSWORD"
 
-# S3 raw GeoTIFF access (raw daily snow-depth product, overwritten every day).
-# Credentials come from the AWS CSV exolabs handed over.
+# S3 raw GeoTIFF access. Layout is dated per the exolabs gitbook
+# (https://exolabs-ch.gitbook.io/cosmos/raw-data-listing#snow-depth):
+#   <prefix>/<YYYY-MM-DD>/<YYYY-MM-DD>+000_<prefix>_HS_product.tif
+# (NOT a flat/overwritten-daily file, despite what earlier notes here
+# assumed - see docs/cosmos-api.md). Credentials come from the AWS CSV
+# exolabs handed over.
 cosmos_s3_bucket             = "exolabs-swiss-project"
 cosmos_s3_prefix             = "alps"
 cosmos_aws_access_key_id     = "YOUR_AWS_ACCESS_KEY_ID"
