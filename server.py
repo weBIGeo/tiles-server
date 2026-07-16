@@ -22,7 +22,7 @@ import config
 import log_config
 import util
 import db
-import debug_ortho
+from tile_creators import debug_ortho
 import notify
 import routes_v1
 from flask import Flask, send_from_directory
@@ -41,6 +41,11 @@ app.register_blueprint(routes_v1.bp)
 @app.route("/", methods=["GET"])
 def index():
     return send_from_directory("docs", "index.html")
+
+
+@app.route("/map", methods=["GET"])
+def map_view():
+    return send_from_directory("docs", "map.html")
 
 
 # Unversioned alias — delegates to the routes_v1 handler

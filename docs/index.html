@@ -108,6 +108,7 @@
       <span style="font-size:1.8rem">🧩</span>
       <h1 class="fs-4 fw-semibold mb-0">weBIGeo Tiles Server</h1>
       <span class="badge rounded-pill text-bg-primary ms-1" id="version-badge">…</span>
+      <a href="./map" class="btn btn-sm btn-outline-primary ms-auto">🗺️ View map</a>
     </div>
 
     <!-- === STATUS === -->
@@ -116,6 +117,12 @@
         <span class="status-dot" id="status-dot"></span>
         <span class="fs-5 fw-semibold text-capitalize" id="status-label">connecting…</span>
       </div>
+    </div>
+
+    <!-- === BACKGROUND PROCESSES === -->
+    <div class="card mb-4 d-none" id="processes-card">
+      <div class="card-header">Background processes</div>
+      <div class="card-body" id="processes-body"></div>
     </div>
 
     <!-- === ABOUT === -->
@@ -144,6 +151,26 @@
     <div class="card mb-3">
       <div class="card-header d-flex align-items-center gap-2">
         <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/processes</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Snapshot of currently running (and recently finished) background
+          processes, e.g. tile generation jobs. Rendered as the progress bars above. A process disappears from
+          this list a short while after it finishes.</p>
+        <pre class="border rounded p-3 small mb-0"><code>[{
+  "key": "debug_ortho",
+  "label": "Debug ortho tiles",
+  "state": "running",
+  "current": 4200,
+  "total": 9938,
+  "message": "z=17"
+}]</code></pre>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
         <code>/v1/debug-ortho/status</code>
       </div>
       <div class="card-body">
@@ -166,6 +193,7 @@
           basemap.at's own WMTS layout (z/y/x). Returns <code>image/jpeg</code> on success,
           <code>503</code> while the dataset is still generating, <code>404</code> for any tile outside the
           covered area/zoom range.</p>
+        <a href="./map" class="btn btn-sm btn-outline-primary">🗺️ View these tiles on a map &rarr;</a>
       </div>
     </div>
 
@@ -201,6 +229,48 @@
     }
 
     poll();
+
+    // === BACKGROUND PROCESSES ===
+    const processesCard = document.getElementById('processes-card');
+    const processesBody = document.getElementById('processes-body');
+
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    function renderProcess(p) {
+      const pct = p.total ? Math.round(100 * p.current / p.total) : null;
+      const barClass = p.state === 'done' ? 'bg-success'
+        : p.state === 'error' ? 'bg-danger'
+          : 'progress-bar-striped progress-bar-animated';
+      const width = pct !== null ? pct : 100;
+      const detail = p.message || (p.total ? `${p.current}/${p.total}` : '');
+      return `
+        <div class="mb-3">
+          <div class="d-flex justify-content-between small mb-1">
+            <span>${escapeHtml(p.label)}</span>
+            <span class="text-secondary">${escapeHtml(detail)}</span>
+          </div>
+          <div class="progress" style="height:8px">
+            <div class="progress-bar ${barClass}" style="width:${width}%"></div>
+          </div>
+        </div>`;
+    }
+
+    async function pollProcesses() {
+      try {
+        const list = await fetch('./v1/processes').then(r => r.json());
+        if (list.length === 0) {
+          processesCard.classList.add('d-none');
+        } else {
+          processesCard.classList.remove('d-none');
+          processesBody.innerHTML = list.map(renderProcess).join('');
+        }
+      } catch { /* leave whatever was last shown */ }
+      setTimeout(pollProcesses, 2000);
+    }
+
+    pollProcesses();
   </script>
 </body>
 

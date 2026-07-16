@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>weBIGeo Tiles Server — Map</title>
+  <link rel="icon"
+    href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'><text y='25' font-size='27'>🧩</text></svg>">
+  <script>
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    document.documentElement.setAttribute('data-bs-theme', mq.matches ? 'dark' : 'light');
+    mq.addEventListener('change', e => document.documentElement.setAttribute('data-bs-theme', e.matches ? 'dark' : 'light'));
+  </script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootswatch@5.3.3/dist/flatly/bootstrap.min.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <style>
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+    }
+
+    #map {
+      position: absolute;
+      top: 56px;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #ccc;
+    }
+
+    .status-banner {
+      position: absolute;
+      top: 68px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1000;
+    }
+
+    .layer-order-control {
+      background: var(--bs-body-bg, #fff);
+      color: var(--bs-body-color, #212529);
+      border-radius: .5rem;
+      box-shadow: 0 1px 5px rgba(0, 0, 0, .4);
+      min-width: 200px;
+    }
+
+    .layer-order-control ul {
+      list-style: none;
+      margin: 0;
+      padding: .4rem;
+    }
+
+    .layer-order-control li {
+      display: flex;
+      align-items: center;
+      gap: .4rem;
+      padding: .25rem .3rem;
+      border-radius: .25rem;
+      cursor: grab;
+    }
+
+    .layer-order-control li:hover {
+      background: rgba(127, 127, 127, .15);
+    }
+
+    .layer-order-control li.dragging {
+      opacity: .4;
+    }
+
+    .layer-order-control li.drag-over {
+      outline: 2px dashed #6c757d;
+    }
+
+    .layer-order-control .drag-handle {
+      color: #6c757d;
+      user-select: none;
+    }
+
+    .layer-order-control label {
+      display: flex;
+      align-items: center;
+      gap: .4rem;
+      margin: 0;
+      flex-grow: 1;
+      cursor: pointer;
+    }
+  </style>
+</head>
+
+<body>
+  <nav class="navbar navbar-expand px-3" style="height:56px">
+    <a class="navbar-brand d-flex align-items-center gap-2" href="./">
+      <span style="font-size:1.4rem">🧩</span>
+      <span class="fs-6 fw-semibold">weBIGeo Tiles Server</span>
+    </a>
+    <span class="text-secondary small ms-2">Debug ortho tiles</span>
+  </nav>
+
+  <div id="map"></div>
+  <div class="alert alert-warning shadow status-banner d-none" id="status-banner" role="alert"></div>
+
+  <script>
+    // Stephansplatz, matches debug_ortho.STEPHANSPLATZ_LAT/LON.
+    const CENTER = [48.2084639, 16.3720438];
+
+    const map = L.map('map', {
+      center: CENTER,
+      zoom: 17,
+      minZoom: 2,
+      maxZoom: 21,
+    });
+
+    const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 21,
+      maxNativeZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    });
+
+    // Path order is z/y/x, matching basemap.at's own WMTS layout (see debug_ortho.py).
+    const basemapAtLayer = L.tileLayer('https://mapsneu.wien.gv.at/basemap/geolandbasemap/normal/google3857/{z}/{y}/{x}.png', {
+      maxZoom: 21,
+      maxNativeZoom: 20,
+      attribution: '&copy; <a href="https://basemap.at/">basemap.at</a>',
+    }).addTo(map);
+
+    // Same source basemap.at orthofoto tiles debug_ortho.py itself fetches
+    // (see URL_TEMPLATE there), served here directly/unprocessed for comparison.
+    const basemapAtOrthoLayer = L.tileLayer('https://mapsneu.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg', {
+      maxZoom: 21,
+      maxNativeZoom: 20,
+      attribution: '&copy; <a href="https://basemap.at/">basemap.at</a>',
+    }).addTo(map);
+
+    const debugOrthoLayer = L.tileLayer('./v1/debug-ortho/{z}/{y}/{x}.jpeg', {
+      tileSize: 256,
+      minZoom: 0,
+      maxZoom: 21,
+      minNativeZoom: 0,
+      maxNativeZoom: 21,
+      attribution: 'Imagery &copy; <a href="https://basemap.at/">basemap.at</a> (weBIGeo debug dataset)',
+    }).addTo(map);
+
+    // All four are overlays (not mutually-exclusive base layers), listed here
+    // topmost-first. Order in this array IS the stacking order - the custom
+    // control below lets it be dragged to rearrange, since Leaflet's built-in
+    // layers control has no reordering support.
+    const layerEntries = [
+      { name: 'Debug ortho tiles', layer: debugOrthoLayer, active: true },
+      { name: 'basemap.at (satellite)', layer: basemapAtOrthoLayer, active: true },
+      { name: 'basemap.at', layer: basemapAtLayer, active: true },
+      { name: 'OpenStreetMap', layer: osmLayer, active: false },
+    ];
+
+    // Re-stack every active layer bottom-to-top by calling the GridLayer-level
+    // bringToFront() (raises within the shared tile pane) in list order, back
+    // to front, so the array's front entry ends up genuinely on top.
+    function applyLayerOrder() {
+      for (let i = layerEntries.length - 1; i >= 0; i--) {
+        const entry = layerEntries[i];
+        if (entry.active && map.hasLayer(entry.layer)) {
+          entry.layer.bringToFront();
+        }
+      }
+    }
+
+    const LayerOrderControl = L.Control.extend({
+      options: { position: 'topright' },
+      onAdd: function () {
+        const container = L.DomUtil.create('div', 'leaflet-bar layer-order-control');
+        L.DomEvent.disableClickPropagation(container);
+        L.DomEvent.disableScrollPropagation(container);
+        this._container = container;
+        this._renderList();
+        return container;
+      },
+      _renderList: function () {
+        const container = this._container;
+        container.innerHTML = '';
+        const list = L.DomUtil.create('ul', '', container);
+
+        layerEntries.forEach((entry, index) => {
+          const item = L.DomUtil.create('li', '', list);
+          item.draggable = true;
+          item.dataset.index = String(index);
+
+          const handle = L.DomUtil.create('span', 'drag-handle', item);
+          handle.textContent = '⠿';
+
+          const label = L.DomUtil.create('label', '', item);
+          const checkbox = L.DomUtil.create('input', '', label);
+          checkbox.type = 'checkbox';
+          checkbox.checked = entry.active;
+          const text = L.DomUtil.create('span', '', label);
+          text.textContent = entry.name;
+
+          checkbox.addEventListener('change', () => {
+            entry.active = checkbox.checked;
+            if (entry.active) {
+              map.addLayer(entry.layer);
+            } else {
+              map.removeLayer(entry.layer);
+            }
+            applyLayerOrder();
+          });
+
+          item.addEventListener('dragstart', e => {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', String(index));
+            item.classList.add('dragging');
+          });
+          item.addEventListener('dragend', () => item.classList.remove('dragging'));
+          item.addEventListener('dragover', e => {
+            e.preventDefault();
+            item.classList.add('drag-over');
+          });
+          item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
+          item.addEventListener('drop', e => {
+            e.preventDefault();
+            item.classList.remove('drag-over');
+            const fromIndex = Number(e.dataTransfer.getData('text/plain'));
+            const toIndex = Number(item.dataset.index);
+            if (fromIndex === toIndex) return;
+            const [moved] = layerEntries.splice(fromIndex, 1);
+            layerEntries.splice(toIndex, 0, moved);
+            applyLayerOrder();
+            this._renderList();
+          });
+        });
+      },
+    });
+
+    new LayerOrderControl().addTo(map);
+    applyLayerOrder();
+
+    const banner = document.getElementById('status-banner');
+
+    async function pollStatus() {
+      try {
+        const { status } = await fetch('./v1/debug-ortho/status').then(r => r.json());
+        if (status === 'ready') {
+          if (!banner.classList.contains('d-none')) {
+            banner.classList.add('d-none');
+            debugOrthoLayer.redraw();
+          }
+          return; // stop polling once ready
+        }
+        banner.classList.remove('d-none');
+        banner.className = 'alert shadow status-banner ' + (status === 'error' ? 'alert-danger' : 'alert-warning');
+        banner.textContent = status === 'error'
+          ? 'Debug ortho tile generation failed — check the server log.'
+          : 'Debug ortho tiles are still generating, some tiles may be missing…';
+      } catch {
+        banner.classList.remove('d-none');
+        banner.className = 'alert alert-danger shadow status-banner';
+        banner.textContent = 'Could not reach the tiles server.';
+      }
+      setTimeout(pollStatus, 3000);
+    }
+
+    pollStatus();
+  </script>
+</body>
+
+</html>

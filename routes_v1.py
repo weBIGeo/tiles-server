@@ -16,8 +16,9 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #############################################################################
 
-import debug_ortho
+import processes
 import util
+from tile_creators import debug_ortho
 from flask import Blueprint, Response, abort, jsonify
 
 bp = Blueprint("v1", __name__, url_prefix="/v1")
@@ -41,17 +42,24 @@ def status():
 bp.add_url_rule("/status", view_func=status)
 
 
+def processes_status():
+    return jsonify(processes.list_all())
+
+
+bp.add_url_rule("/processes", view_func=processes_status)
+
+
 def debug_ortho_status():
     return jsonify({"status": debug_ortho.get_status()})
 
 
 def debug_ortho_tile(z: int, y: int, x: int):
+    data = debug_ortho.get_tile(z, x, y)
+    if data is not None:
+        return Response(data, mimetype="image/jpeg")
     if not debug_ortho.is_ready():
         return jsonify({"error": "debug ortho tiles are still being generated"}), 503
-    data = debug_ortho.get_tile(z, x, y)
-    if data is None:
-        abort(404)
-    return Response(data, mimetype="image/jpeg")
+    abort(404)
 
 
 bp.add_url_rule("/debug-ortho/status", view_func=debug_ortho_status)
