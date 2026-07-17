@@ -16,6 +16,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #############################################################################
 
+import concurrent.futures
 import io
 import logging
 import math
@@ -73,8 +74,13 @@ SYNTH_LABEL_FONT_COLOR = (255, 0, 0, 255)
 # HTTP client settings for downloading tiles from basemap.at.
 USER_AGENT = "weBIGeo-Tiles-Server-debug-ortho/1.0"
 REQUEST_TIMEOUT = 15   # seconds
-REQUEST_DELAY = 0.05   # seconds, polite delay between requests
+REQUEST_DELAY = 0.05   # seconds, backoff before retrying a failed request
 RETRY_COUNT = 3        # additional attempts after the first failure
+
+# Concurrent tile fetch/process/save workers. The source is now our own
+# gataki.cg.tuwien.ac.at mirror rather than the public basemap.at service,
+# so there's no need to throttle to one request at a time.
+DOWNLOAD_WORKERS = 16
 
 _db: tile_db.TileDb | None = None
 
@@ -96,7 +102,7 @@ def init() -> None:
     a wider synth radius) or an interrupted previous run is picked up and
     resumed correctly rather than being masked by a stale flag."""
     global _db
-    _db = tile_db.TileDb(DB_PATH)
+    _db = tile_db.TileDb(DB_PATH, commit_batch_size=200)
 
     processes.start(PROCESS_KEY, PROCESS_LABEL)
     logger.info("debug-ortho: checking dataset at %s, generating any missing tiles in background", DB_PATH)
@@ -213,11 +219,43 @@ def _encode_jpeg(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
+def _process_and_save_tile(
+    session: requests.Session, z: int, x: int, y: int, needs_pristine: bool
+) -> tuple[bool, Image.Image | None]:
+    """Download, label, encode and save one tile. Runs on a worker thread -
+    touches only the session and this tile's own data, no shared state.
+    Returns (success, pristine_image_or_None); pristine is the pre-label
+    copy when needs_pristine, for the caller to stash into pristine_parents."""
+    raw = _download_tile(session, z, x, y)
+    if raw is None:
+        logger.warning("debug-ortho: giving up on z=%d x=%d y=%d", z, x, y)
+        return False, None
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    pristine = img.copy() if needs_pristine else None
+    labeled = _draw_label(img, z, x, y)
+    _save_tile(z, x, y, _encode_jpeg(labeled))
+    return True, pristine
+
+
+def _process_synth_tile(parent_img: Image.Image, dx: int, dy: int, child_x: int, child_y: int) -> None:
+    """Crop/upscale/label/save one synthetic overzoom child tile. Runs on a
+    worker thread - touches only its own data, no shared state."""
+    crop_box = (dx * 128, dy * 128, dx * 128 + 128, dy * 128 + 128)
+    quadrant = parent_img.crop(crop_box).resize((256, 256), Image.BICUBIC)
+    labeled = _draw_label(quadrant, SYNTH_ZOOM, child_x, child_y, font_color=SYNTH_LABEL_FONT_COLOR)
+    _save_tile(SYNTH_ZOOM, child_x, child_y, _encode_jpeg(labeled))
+
+
 def _generate_all() -> None:
     try:
         start = time.monotonic()
         session = requests.Session()
         session.headers["User-Agent"] = USER_AGENT
+        # Default urllib3 pool size (10) would otherwise queue requests once
+        # concurrency exceeds it, capping the DOWNLOAD_WORKERS speedup below.
+        adapter = requests.adapters.HTTPAdapter(pool_connections=DOWNLOAD_WORKERS, pool_maxsize=DOWNLOAD_WORKERS)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
 
         # Identify the z(MAX_ZOOM) parent tiles around Stephansplatz up front so
         # the main pyramid loop below knows which tiles to keep a pristine
@@ -243,46 +281,64 @@ def _generate_all() -> None:
         rate = progress.RateTracker()
         processes.update(PROCESS_KEY, done, total=total, message=f"{done}/{total} tiles generated")
 
-        for z, (xmin, xmax, ymin, ymax) in zoom_ranges.items():
-            for x in range(xmin, xmax + 1):
-                for y in range(ymin, ymax + 1):
-                    is_synth_parent = z == MAX_ZOOM and (x, y) in parent_coords
-                    # A synth parent only needs fetching fresh (for its pristine,
-                    # pre-label bytes) if at least one of its zoom-(MAX_ZOOM+1)
-                    # children is still missing; otherwise treat it like any
-                    # other tile and just skip it if already saved.
-                    needs_pristine = is_synth_parent and not _synth_children_exist(x, y)
-                    if not needs_pristine and _tile_exists(z, x, y):
-                        done += 1
-                        processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={z}, {rate.sample(done)})")
+        # All progress bookkeeping (done, pristine_parents, rate, processes.update)
+        # happens on the main thread only, as futures complete below - worker
+        # threads just do the download/decode/label/encode/save work, so no
+        # extra locking is needed beyond TileDb's own internal lock.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+            for z, (xmin, xmax, ymin, ymax) in zoom_ranges.items():
+                tasks = []
+                for x in range(xmin, xmax + 1):
+                    for y in range(ymin, ymax + 1):
+                        is_synth_parent = z == MAX_ZOOM and (x, y) in parent_coords
+                        # A synth parent only needs fetching fresh (for its pristine,
+                        # pre-label bytes) if at least one of its zoom-(MAX_ZOOM+1)
+                        # children is still missing; otherwise treat it like any
+                        # other tile and just skip it if already saved.
+                        needs_pristine = is_synth_parent and not _synth_children_exist(x, y)
+                        if not needs_pristine and _tile_exists(z, x, y):
+                            done += 1
+                            processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={z}, {rate.sample(done)})")
+                            continue
+                        tasks.append((x, y, needs_pristine))
+
+                if not tasks:
+                    continue
+                futures = {
+                    executor.submit(_process_and_save_tile, session, z, x, y, needs_pristine): (x, y)
+                    for x, y, needs_pristine in tasks
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    x, y = futures[future]
+                    success, pristine = future.result()
+                    if not success:
                         continue
-                    raw = _download_tile(session, z, x, y)
-                    if raw is None:
-                        logger.warning("debug-ortho: giving up on z=%d x=%d y=%d", z, x, y)
-                        continue
-                    img = Image.open(io.BytesIO(raw)).convert("RGB")
-                    if needs_pristine:
-                        pristine_parents[(x, y)] = img.copy()
-                    labeled = _draw_label(img, z, x, y)
-                    _save_tile(z, x, y, _encode_jpeg(labeled))
+                    if pristine is not None:
+                        pristine_parents[(x, y)] = pristine
                     done += 1
                     processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={z}, {rate.sample(done)})")
-                    time.sleep(REQUEST_DELAY)
 
-        synth_z = SYNTH_ZOOM
-        for (px, py) in parent_coords:
-            parent_img = pristine_parents.get((px, py))
-            for dx in (0, 1):
-                for dy in (0, 1):
-                    child_x, child_y = px * 2 + dx, py * 2 + dy
+            synth_z = SYNTH_ZOOM
+            synth_tasks = []
+            for (px, py) in parent_coords:
+                parent_img = pristine_parents.get((px, py))
+                for dx in (0, 1):
+                    for dy in (0, 1):
+                        child_x, child_y = px * 2 + dx, py * 2 + dy
+                        if parent_img is None or _tile_exists(synth_z, child_x, child_y):
+                            done += 1
+                            processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={synth_z}, {rate.sample(done)})")
+                            continue
+                        synth_tasks.append((parent_img, dx, dy, child_x, child_y))
+
+            if synth_tasks:
+                synth_futures = [
+                    executor.submit(_process_synth_tile, parent_img, dx, dy, child_x, child_y)
+                    for parent_img, dx, dy, child_x, child_y in synth_tasks
+                ]
+                for future in concurrent.futures.as_completed(synth_futures):
+                    future.result()
                     done += 1
-                    if parent_img is None or _tile_exists(synth_z, child_x, child_y):
-                        processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={synth_z}, {rate.sample(done)})")
-                        continue
-                    crop_box = (dx * 128, dy * 128, dx * 128 + 128, dy * 128 + 128)
-                    quadrant = parent_img.crop(crop_box).resize((256, 256), Image.BICUBIC)
-                    labeled = _draw_label(quadrant, synth_z, child_x, child_y, font_color=SYNTH_LABEL_FONT_COLOR)
-                    _save_tile(synth_z, child_x, child_y, _encode_jpeg(labeled))
                     processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={synth_z}, {rate.sample(done)})")
 
         elapsed = time.monotonic() - start
