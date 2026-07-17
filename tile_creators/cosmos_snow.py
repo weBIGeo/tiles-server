@@ -16,6 +16,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #############################################################################
 
+import concurrent.futures
 import datetime as dt
 import io
 import logging
@@ -79,6 +80,12 @@ TILE_SIZE = 256
 # accumulate before a batch commit, bounding how much work an ungraceful
 # crash mid-run could lose.
 COMMIT_BATCH_SIZE = 500
+
+# Concurrent slice/encode/save (z=MAX_ZOOM) and decode/downsample/encode/save
+# (z<MAX_ZOOM) workers. Unlike debug_ortho's DOWNLOAD_WORKERS=16 (sized for
+# HTTP latency hiding), this workload is CPU-bound (PNG encode, numpy
+# slicing/downsampling) with no network I/O, so it's sized off core count.
+GENERATION_WORKERS = os.cpu_count() or 4
 
 # Web Mercator (EPSG:3857) world half-extent in meters - used to convert an
 # XYZ tile index directly into its bounds in that CRS.
@@ -259,6 +266,16 @@ def _tile_bounds_3857(z: int, x: int, y: int) -> tuple[float, float, float, floa
     return left, bottom, right, top
 
 
+def _tile_range_bounds_3857(z: int, xmin: int, xmax: int, ymin: int, ymax: int) -> tuple[float, float, float, float]:
+    """Union (left, bottom, right, top) in EPSG:3857 meters of every tile in
+    an [xmin,xmax]x[ymin,ymax] range - since the tile grid is contiguous and
+    gap-free, this is just the top-left tile's (left, top) and the
+    bottom-right tile's (right, bottom)."""
+    left, _, _, top = _tile_bounds_3857(z, xmin, ymin)
+    _, bottom, right, _ = _tile_bounds_3857(z, xmax, ymax)
+    return left, bottom, right, top
+
+
 # --------------------------------------------------------------------------
 # S3 download
 # --------------------------------------------------------------------------
@@ -303,19 +320,26 @@ def _ensure_source_tif(date: str) -> str:
 # --------------------------------------------------------------------------
 # Raster read
 # --------------------------------------------------------------------------
-def _read_tile_from_raster(src: rasterio.DatasetReader, z: int, x: int, y: int) -> tuple[np.ndarray, np.ndarray]:
-    """Windowed read of one 256x256 tile directly from the source raster.
-    Returns (value_cm: uint16 array, valid: bool array)."""
-    left, bottom, right, top = _tile_bounds_3857(z, x, y)
+def _read_mosaic_from_raster(
+    src: rasterio.DatasetReader, z: int, xmin: int, xmax: int, ymin: int, ymax: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Windowed read of an entire tile range in one pass, tile-grid-aligned
+    so each tile is a plain slice of the result - one bulk read instead of
+    one small windowed read per output tile. Returns (value_cm: uint16
+    array, valid: bool array), each shaped
+    ((ymax-ymin+1)*TILE_SIZE, (xmax-xmin+1)*TILE_SIZE)."""
+    left, bottom, right, top = _tile_range_bounds_3857(z, xmin, xmax, ymin, ymax)
     minx, miny, maxx, maxy = rasterio.warp.transform_bounds(
         "EPSG:3857", src.crs, left, bottom, right, top
     )
     window = rasterio.windows.from_bounds(minx, miny, maxx, maxy, transform=src.transform)
 
+    mosaic_h = (ymax - ymin + 1) * TILE_SIZE
+    mosaic_w = (xmax - xmin + 1) * TILE_SIZE
     data = src.read(
         1,
         window=window,
-        out_shape=(TILE_SIZE, TILE_SIZE),
+        out_shape=(mosaic_h, mosaic_w),
         resampling=Resampling.nearest,
         boundless=True,
         masked=True,
@@ -385,6 +409,95 @@ def _compose_parent_tile(children: dict[tuple[int, int], bytes | None]) -> tuple
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
+def _process_mosaic_tile(
+    value_cm_mosaic: np.ndarray, valid_mosaic: np.ndarray, xmin: int, ymin: int, date: str, x: int, y: int
+) -> None:
+    """Worker: slice one tile out of the bulk-read MAX_ZOOM mosaic, encode
+    and save it. Runs on a worker thread - the mosaic arrays are never
+    mutated after the read, so concurrent slicing needs no lock; touches
+    only this tile's own slice/save otherwise."""
+    row0 = (y - ymin) * TILE_SIZE
+    col0 = (x - xmin) * TILE_SIZE
+    value_cm = value_cm_mosaic[row0:row0 + TILE_SIZE, col0:col0 + TILE_SIZE]
+    valid = valid_mosaic[row0:row0 + TILE_SIZE, col0:col0 + TILE_SIZE]
+    _save_tile(date, MAX_ZOOM, x, y, _encode_tile(value_cm, valid))
+
+
+def _generate_max_zoom_tiles(
+    date: str, src: rasterio.DatasetReader, xmin: int, xmax: int, ymin: int, ymax: int,
+    key: str, total: int, done: int, rate: progress.RateTracker,
+) -> int:
+    """Generate every MAX_ZOOM tile in [xmin,xmax]x[ymin,ymax]. Tiles already
+    in the db are skipped (resume support) without touching the raster at
+    all; if anything is missing, the whole range is read from the source
+    GeoTIFF in one bulk pass (_read_mosaic_from_raster) and the missing
+    tiles are sliced/encoded/saved in parallel - one disk read total instead
+    of one per tile."""
+    tasks = []
+    for x in range(xmin, xmax + 1):
+        for y in range(ymin, ymax + 1):
+            if _tile_exists(date, MAX_ZOOM, x, y):
+                done += 1
+                processes.update(key, done, message=f"{done}/{total} tiles generated (z={MAX_ZOOM}, {rate.sample(done)})")
+            else:
+                tasks.append((x, y))
+
+    if not tasks:
+        return done
+
+    value_cm_mosaic, valid_mosaic = _read_mosaic_from_raster(src, MAX_ZOOM, xmin, xmax, ymin, ymax)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=GENERATION_WORKERS) as executor:
+        futures = {
+            executor.submit(_process_mosaic_tile, value_cm_mosaic, valid_mosaic, xmin, ymin, date, x, y): (x, y)
+            for x, y in tasks
+        }
+        for future in concurrent.futures.as_completed(futures):
+            future.result()  # re-raise a worker exception on the main thread
+            done += 1
+            processes.update(key, done, message=f"{done}/{total} tiles generated (z={MAX_ZOOM}, {rate.sample(done)})")
+    return done
+
+
+def _process_pyramid_tile(date: str, z: int, x: int, y: int) -> None:
+    """Worker: compose one lower-zoom tile from its 4 already-saved z+1
+    children, encode and save it. Runs on a worker thread - get_tile/
+    _save_tile go through TileDb's own lock, so concurrent calls are safe."""
+    children = {
+        (dx, dy): get_tile(date, z + 1, x * 2 + dx, y * 2 + dy)
+        for dx in (0, 1) for dy in (0, 1)
+    }
+    value_cm, valid = _compose_parent_tile(children)
+    _save_tile(date, z, x, y, _encode_tile(value_cm, valid))
+
+
+def _generate_pyramid_level(
+    date: str, z: int, xmin: int, xmax: int, ymin: int, ymax: int,
+    key: str, total: int, done: int, rate: progress.RateTracker,
+) -> int:
+    """Generate every tile at zoom `z` in [xmin,xmax]x[ymin,ymax] from its
+    already-saved z+1 children, in parallel. Must only be called after zoom
+    z+1 is fully generated and committed."""
+    tasks = []
+    for x in range(xmin, xmax + 1):
+        for y in range(ymin, ymax + 1):
+            if _tile_exists(date, z, x, y):
+                done += 1
+                processes.update(key, done, message=f"{done}/{total} tiles generated (z={z}, {rate.sample(done)})")
+            else:
+                tasks.append((x, y))
+
+    if not tasks:
+        return done
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=GENERATION_WORKERS) as executor:
+        futures = {executor.submit(_process_pyramid_tile, date, z, x, y): (x, y) for x, y in tasks}
+        for future in concurrent.futures.as_completed(futures):
+            future.result()  # re-raise a worker exception on the main thread
+            done += 1
+            processes.update(key, done, message=f"{done}/{total} tiles generated (z={z}, {rate.sample(done)})")
+    return done
+
+
 def _generate_for_date(date: str) -> None:
     key = PROCESS_KEY_TEMPLATE.format(date=date)
     try:
@@ -408,28 +521,12 @@ def _generate_for_date(date: str) -> None:
                 raise RuntimeError(f"cosmos-snow[{date}]: source GeoTIFF has no CRS - cannot georeference tiles")
 
             xmin, xmax, ymin, ymax = zoom_ranges[MAX_ZOOM]
-            for x in range(xmin, xmax + 1):
-                for y in range(ymin, ymax + 1):
-                    if not _tile_exists(date, MAX_ZOOM, x, y):
-                        value_cm, valid = _read_tile_from_raster(src, MAX_ZOOM, x, y)
-                        _save_tile(date, MAX_ZOOM, x, y, _encode_tile(value_cm, valid))
-                    done += 1
-                    processes.update(key, done, message=f"{done}/{total} tiles generated (z={MAX_ZOOM}, {rate.sample(done)})")
-            _commit(date)  # flush the tail of this zoom level
+            done = _generate_max_zoom_tiles(date, src, xmin, xmax, ymin, ymax, key, total, done, rate)
+        _commit(date)  # flush the tail of this zoom level
 
         for z in range(MAX_ZOOM - 1, MIN_ZOOM - 1, -1):
             xmin, xmax, ymin, ymax = zoom_ranges[z]
-            for x in range(xmin, xmax + 1):
-                for y in range(ymin, ymax + 1):
-                    if not _tile_exists(date, z, x, y):
-                        children = {
-                            (dx, dy): get_tile(date, z + 1, x * 2 + dx, y * 2 + dy)
-                            for dx in (0, 1) for dy in (0, 1)
-                        }
-                        value_cm, valid = _compose_parent_tile(children)
-                        _save_tile(date, z, x, y, _encode_tile(value_cm, valid))
-                    done += 1
-                    processes.update(key, done, message=f"{done}/{total} tiles generated (z={z}, {rate.sample(done)})")
+            done = _generate_pyramid_level(date, z, xmin, xmax, ymin, ymax, key, total, done, rate)
             _commit(date)  # flush the tail of this zoom level
 
         elapsed = time.monotonic() - start
