@@ -55,13 +55,7 @@ import requests
 # (config.py is git-ignored, config.example.py holds the placeholders).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config  # noqa: E402
-
-
-# --------------------------------------------------------------------------
-# Region of interest. Austria bounding box in WGS84 (lon/lat degrees).
-# west, south, east, north
-# --------------------------------------------------------------------------
-AUSTRIA_BBOX = (9.53, 46.37, 17.16, 49.02)
+from const import BBOXES  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -213,7 +207,7 @@ def _crop_to_austria(tif_path: str) -> None:
         print("  (skip crop: GDAL python bindings not installed; install gdal or "
               "run gdal_translate -projwin manually)")
         return
-    west, south, east, north = AUSTRIA_BBOX
+    west, south, east, north = BBOXES["AUSTRIA"]
     out = tif_path.replace(".tif", "_austria.tif")
     # projWin is (ulx, uly, lrx, lry) in the dataset's CRS; GDAL warps the
     # WGS84 bbox via projWinSRS=EPSG:4326.
@@ -247,7 +241,7 @@ def main() -> None:
         import json
         print(json.dumps(list_products(_session()), indent=2))
     elif args.cmd == "tiles":
-        download_tiles(args.product, args.zoom, AUSTRIA_BBOX, args.out)
+        download_tiles(args.product, args.zoom, BBOXES["AUSTRIA"], args.out)
     elif args.cmd == "tif":
         download_raw_tifs(args.out, args.crop_austria)
 

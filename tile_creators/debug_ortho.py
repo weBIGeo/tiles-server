@@ -19,8 +19,6 @@
 import io
 import logging
 import math
-import os
-import sqlite3
 import threading
 import time
 
@@ -28,6 +26,8 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 import processes
+import tile_db
+from tile_creators import progress
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,8 @@ DB_PATH = "data/debug_ortho_tiles.db"
 
 # basemap.at orthofoto WMTS tile URL. Path order is {z}/{y}/{x}, matching
 # basemap.at's own TileMatrix/TileRow/TileCol layout (not the usual z/x/y).
-URL_TEMPLATE = "https://mapsneu.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg"
+URL_TEMPLATE = "https://gataki.cg.tuwien.ac.at/raw/basemap/tiles/{z}/{y}/{x}.jpeg"
+#URL_TEMPLATE = "https://mapsneu.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg"
 
 # Real zoom range downloaded from basemap.at (20 is the source's actual max zoom).
 MIN_ZOOM = 0
@@ -75,8 +76,7 @@ REQUEST_TIMEOUT = 15   # seconds
 REQUEST_DELAY = 0.05   # seconds, polite delay between requests
 RETRY_COUNT = 3        # additional attempts after the first failure
 
-_conn: sqlite3.Connection | None = None
-_lock = threading.Lock()
+_db: tile_db.TileDb | None = None
 
 # Public status wording kept stable for /v1/debug-ortho/status and docs/map.html,
 # backed by the generic processes registry rather than an enum of our own.
@@ -95,22 +95,8 @@ def init() -> None:
     _generate_all walks the full expected tile set, so a config change (e.g.
     a wider synth radius) or an interrupted previous run is picked up and
     resumed correctly rather than being masked by a stale flag."""
-    global _conn
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
-    _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    _conn.row_factory = sqlite3.Row
-    with _lock:
-        _conn.executescript("""
-            CREATE TABLE IF NOT EXISTS tiles (
-                z INTEGER NOT NULL,
-                x INTEGER NOT NULL,
-                y INTEGER NOT NULL,
-                data BLOB NOT NULL,
-                PRIMARY KEY (z, x, y)
-            );
-        """)
-        _conn.commit()
+    global _db
+    _db = tile_db.TileDb(DB_PATH)
 
     processes.start(PROCESS_KEY, PROCESS_LABEL)
     logger.info("debug-ortho: checking dataset at %s, generating any missing tiles in background", DB_PATH)
@@ -128,28 +114,15 @@ def is_ready() -> bool:
 
 
 def get_tile(z: int, x: int, y: int) -> bytes | None:
-    with _lock:
-        row = _conn.execute(
-            "SELECT data FROM tiles WHERE z = ? AND x = ? AND y = ?", (z, x, y)
-        ).fetchone()
-    return row["data"] if row else None
+    return _db.get_tile(z, x, y)
 
 
 def _save_tile(z: int, x: int, y: int, data: bytes) -> None:
-    with _lock:
-        _conn.execute(
-            "INSERT OR REPLACE INTO tiles (z, x, y, data) VALUES (?, ?, ?, ?)",
-            (z, x, y, data),
-        )
-        _conn.commit()
+    _db.save_tile(z, x, y, data)
 
 
 def _tile_exists(z: int, x: int, y: int) -> bool:
-    with _lock:
-        row = _conn.execute(
-            "SELECT 1 FROM tiles WHERE z = ? AND x = ? AND y = ? LIMIT 1", (z, x, y)
-        ).fetchone()
-    return row is not None
+    return _db.tile_exists(z, x, y)
 
 
 def _synth_children_exist(px: int, py: int) -> bool:
@@ -267,6 +240,7 @@ def _generate_all() -> None:
         )
         total += 4 * len(parent_coords)  # synthetic z(MAX_ZOOM+1) tiles
         done = 0
+        rate = progress.RateTracker()
         processes.update(PROCESS_KEY, done, total=total, message=f"{done}/{total} tiles generated")
 
         for z, (xmin, xmax, ymin, ymax) in zoom_ranges.items():
@@ -280,7 +254,7 @@ def _generate_all() -> None:
                     needs_pristine = is_synth_parent and not _synth_children_exist(x, y)
                     if not needs_pristine and _tile_exists(z, x, y):
                         done += 1
-                        processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={z})")
+                        processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={z}, {rate.sample(done)})")
                         continue
                     raw = _download_tile(session, z, x, y)
                     if raw is None:
@@ -292,7 +266,7 @@ def _generate_all() -> None:
                     labeled = _draw_label(img, z, x, y)
                     _save_tile(z, x, y, _encode_jpeg(labeled))
                     done += 1
-                    processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={z})")
+                    processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={z}, {rate.sample(done)})")
                     time.sleep(REQUEST_DELAY)
 
         synth_z = SYNTH_ZOOM
@@ -303,13 +277,13 @@ def _generate_all() -> None:
                     child_x, child_y = px * 2 + dx, py * 2 + dy
                     done += 1
                     if parent_img is None or _tile_exists(synth_z, child_x, child_y):
-                        processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={synth_z})")
+                        processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={synth_z}, {rate.sample(done)})")
                         continue
                     crop_box = (dx * 128, dy * 128, dx * 128 + 128, dy * 128 + 128)
                     quadrant = parent_img.crop(crop_box).resize((256, 256), Image.BICUBIC)
                     labeled = _draw_label(quadrant, synth_z, child_x, child_y, font_color=SYNTH_LABEL_FONT_COLOR)
                     _save_tile(synth_z, child_x, child_y, _encode_jpeg(labeled))
-                    processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={synth_z})")
+                    processes.update(PROCESS_KEY, done, message=f"{done}/{total} tiles generated (z={synth_z}, {rate.sample(done)})")
 
         elapsed = time.monotonic() - start
         processes.finish(PROCESS_KEY, message=f"{done} tiles in {elapsed:.1f}s")

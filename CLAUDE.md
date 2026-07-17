@@ -49,6 +49,14 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
 - **db.py** — single shared SQLite connection (`check_same_thread=False` + a
   `threading.Lock`) for the main tiles DB. No tables exist yet; schema is added here
   as tile processing is built out.
+- **tile_db.py** — `TileDb`, a thread-safe SQLite-backed tile cache shared by
+  `tile_creators/*` modules (a separate concept from `db.py`'s single main-app db,
+  since each tile source has its own cache file(s)). Owns its own connection, lock,
+  and commit-batching counter, opens with `PRAGMA journal_mode=WAL` +
+  `PRAGMA synchronous=NORMAL`, and creates the standard `tiles(z, x, y, data)` table —
+  so a tile source never touches `sqlite3` directly, it just calls `get_tile`/
+  `save_tile`/`tile_exists`/`commit`. Used by `tile_creators/cosmos_snow.py` and
+  `tile_creators/debug_ortho.py`.
 - **log_config.py** — custom colored logging formatter matching the style used across
   weBIGeo projects (see the C++ formatter it mirrors, linked in the module). Sets up
   console + rotating file handlers and per-logger level overrides from
@@ -105,3 +113,9 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
 - A tile source's own tunables (URL templates, bboxes, retry/delay settings, etc.) live
   as constants at the top of its `tile_creators/*.py` module, not in `config.py` —
   `config.py` is reserved for deployment-level settings (paths, ports, credentials).
+
+## Important
+
+- Always ask for architectural decissions first
+- Ask if something is unclear
+- Only do little syntax or smoke tests. Dont run the whole server
