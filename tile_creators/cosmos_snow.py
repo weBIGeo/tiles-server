@@ -75,10 +75,10 @@ MAX_ZOOM = 13
 
 TILE_SIZE = 256
 
-# _save_tile() no longer commits on every call (that meant a disk sync per
-# tile - thousands of them per generation run); this is how many saved tiles
-# accumulate before a batch commit, bounding how much work an ungraceful
-# crash mid-run could lose.
+# TileDb.save_tile() no longer commits on every call (that meant a disk sync
+# per tile - thousands of them per generation run); this is how many saved
+# tiles accumulate before a batch commit, bounding how much work an
+# ungraceful crash mid-run could lose.
 COMMIT_BATCH_SIZE = 500
 
 # Concurrent slice/encode/save (z=MAX_ZOOM) and decode/downsample/encode/save
@@ -162,9 +162,11 @@ def list_dates() -> list[dict]:
 
 
 def start_generation(date: str) -> str:
-    """Kick off (or resume) tile generation for `date` in a background
+    """Kick off tile generation for `date` from scratch in a background
     thread, or return the current status if it's already generating/ready.
-    Never blocks - returns immediately with "generating" or "ready"."""
+    Never blocks - returns immediately with "generating" or "ready". There is
+    no resume: every call (re)generates every tile, even ones already saved
+    from a previous, possibly-failed run."""
     _validate_date(date)
     key = PROCESS_KEY_TEMPLATE.format(date=date)
 
@@ -176,10 +178,10 @@ def start_generation(date: str) -> str:
             return "ready"
         _generating.add(date)
 
-    _open_db(date)
+    conn = _open_db(date)
     processes.start(key, PROCESS_LABEL_TEMPLATE.format(date=date))
     logger.info("cosmos-snow[%s]: starting generation in background", date)
-    threading.Thread(target=_generate_for_date, args=(date,), name=f"cosmos-snow-gen-{date}", daemon=True).start()
+    threading.Thread(target=_generate_for_date, args=(date, conn), name=f"cosmos-snow-gen-{date}", daemon=True).start()
     return "generating"
 
 
@@ -204,9 +206,10 @@ def _open_db(date: str) -> tile_db.TileDb:
         return conn
 
 
-def _get_db(date: str) -> tile_db.TileDb | None:
+def get_db(date: str) -> tile_db.TileDb | None:
     """Like _open_db, but read-only: returns None instead of creating a new
-    (empty) db file for a date nothing has ever generated."""
+    (empty) db file for a date nothing has ever generated. Callers use the
+    returned TileDb's own get_tile/save_tile/etc. directly."""
     with _lock:
         conn = _dbs.get(date)
         if conn is not None:
@@ -214,25 +217,6 @@ def _get_db(date: str) -> tile_db.TileDb | None:
         if not os.path.exists(_db_path(date)):
             return None
     return _open_db(date)
-
-
-def get_tile(date: str, z: int, x: int, y: int) -> bytes | None:
-    conn = _get_db(date)
-    return conn.get_tile(z, x, y) if conn is not None else None
-
-
-def _save_tile(date: str, z: int, x: int, y: int, data: bytes) -> None:
-    """Queues the tile, auto-committing every COMMIT_BATCH_SIZE saves (see
-    TileDb.save_tile) - callers can still force an early flush via _commit()."""
-    _dbs[date].save_tile(z, x, y, data)
-
-
-def _commit(date: str) -> None:
-    _dbs[date].commit()
-
-
-def _tile_exists(date: str, z: int, x: int, y: int) -> bool:
-    return _dbs[date].tile_exists(z, x, y)
 
 
 # --------------------------------------------------------------------------
@@ -410,7 +394,7 @@ def _compose_parent_tile(children: dict[tuple[int, int], bytes | None]) -> tuple
 # Orchestration
 # --------------------------------------------------------------------------
 def _process_mosaic_tile(
-    value_cm_mosaic: np.ndarray, valid_mosaic: np.ndarray, xmin: int, ymin: int, date: str, x: int, y: int
+    value_cm_mosaic: np.ndarray, valid_mosaic: np.ndarray, xmin: int, ymin: int, conn: tile_db.TileDb, x: int, y: int
 ) -> None:
     """Worker: slice one tile out of the bulk-read MAX_ZOOM mosaic, encode
     and save it. Runs on a worker thread - the mosaic arrays are never
@@ -420,35 +404,24 @@ def _process_mosaic_tile(
     col0 = (x - xmin) * TILE_SIZE
     value_cm = value_cm_mosaic[row0:row0 + TILE_SIZE, col0:col0 + TILE_SIZE]
     valid = valid_mosaic[row0:row0 + TILE_SIZE, col0:col0 + TILE_SIZE]
-    _save_tile(date, MAX_ZOOM, x, y, _encode_tile(value_cm, valid))
+    conn.save_tile(MAX_ZOOM, x, y, _encode_tile(value_cm, valid))
 
 
 def _generate_max_zoom_tiles(
-    date: str, src: rasterio.DatasetReader, xmin: int, xmax: int, ymin: int, ymax: int,
+    conn: tile_db.TileDb, src: rasterio.DatasetReader, xmin: int, xmax: int, ymin: int, ymax: int,
     key: str, total: int, done: int, rate: progress.RateTracker,
 ) -> int:
-    """Generate every MAX_ZOOM tile in [xmin,xmax]x[ymin,ymax]. Tiles already
-    in the db are skipped (resume support) without touching the raster at
-    all; if anything is missing, the whole range is read from the source
-    GeoTIFF in one bulk pass (_read_mosaic_from_raster) and the missing
-    tiles are sliced/encoded/saved in parallel - one disk read total instead
-    of one per tile."""
-    tasks = []
-    for x in range(xmin, xmax + 1):
-        for y in range(ymin, ymax + 1):
-            if _tile_exists(date, MAX_ZOOM, x, y):
-                done += 1
-                processes.update(key, done, message=f"{done}/{total} tiles generated (z={MAX_ZOOM}, {rate.sample(done)})")
-            else:
-                tasks.append((x, y))
-
-    if not tasks:
-        return done
+    """Generate every MAX_ZOOM tile in [xmin,xmax]x[ymin,ymax] unconditionally
+    (no resume - existing tiles are overwritten): the whole range is read
+    from the source GeoTIFF in one bulk pass (_read_mosaic_from_raster) and
+    every tile is sliced/encoded/saved in parallel - one disk read total
+    instead of one per tile."""
+    tasks = [(x, y) for x in range(xmin, xmax + 1) for y in range(ymin, ymax + 1)]
 
     value_cm_mosaic, valid_mosaic = _read_mosaic_from_raster(src, MAX_ZOOM, xmin, xmax, ymin, ymax)
     with concurrent.futures.ThreadPoolExecutor(max_workers=GENERATION_WORKERS) as executor:
         futures = {
-            executor.submit(_process_mosaic_tile, value_cm_mosaic, valid_mosaic, xmin, ymin, date, x, y): (x, y)
+            executor.submit(_process_mosaic_tile, value_cm_mosaic, valid_mosaic, xmin, ymin, conn, x, y): (x, y)
             for x, y in tasks
         }
         for future in concurrent.futures.as_completed(futures):
@@ -458,39 +431,29 @@ def _generate_max_zoom_tiles(
     return done
 
 
-def _process_pyramid_tile(date: str, z: int, x: int, y: int) -> None:
+def _process_pyramid_tile(conn: tile_db.TileDb, z: int, x: int, y: int) -> None:
     """Worker: compose one lower-zoom tile from its 4 already-saved z+1
-    children, encode and save it. Runs on a worker thread - get_tile/
-    _save_tile go through TileDb's own lock, so concurrent calls are safe."""
+    children, encode and save it. Runs on a worker thread - TileDb's own lock
+    makes concurrent get_tile/save_tile calls safe."""
     children = {
-        (dx, dy): get_tile(date, z + 1, x * 2 + dx, y * 2 + dy)
+        (dx, dy): conn.get_tile(z + 1, x * 2 + dx, y * 2 + dy)
         for dx in (0, 1) for dy in (0, 1)
     }
     value_cm, valid = _compose_parent_tile(children)
-    _save_tile(date, z, x, y, _encode_tile(value_cm, valid))
+    conn.save_tile(z, x, y, _encode_tile(value_cm, valid))
 
 
 def _generate_pyramid_level(
-    date: str, z: int, xmin: int, xmax: int, ymin: int, ymax: int,
+    conn: tile_db.TileDb, z: int, xmin: int, xmax: int, ymin: int, ymax: int,
     key: str, total: int, done: int, rate: progress.RateTracker,
 ) -> int:
     """Generate every tile at zoom `z` in [xmin,xmax]x[ymin,ymax] from its
-    already-saved z+1 children, in parallel. Must only be called after zoom
-    z+1 is fully generated and committed."""
-    tasks = []
-    for x in range(xmin, xmax + 1):
-        for y in range(ymin, ymax + 1):
-            if _tile_exists(date, z, x, y):
-                done += 1
-                processes.update(key, done, message=f"{done}/{total} tiles generated (z={z}, {rate.sample(done)})")
-            else:
-                tasks.append((x, y))
-
-    if not tasks:
-        return done
+    already-saved z+1 children, in parallel, unconditionally (no resume).
+    Must only be called after zoom z+1 is fully generated and committed."""
+    tasks = [(x, y) for x in range(xmin, xmax + 1) for y in range(ymin, ymax + 1)]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=GENERATION_WORKERS) as executor:
-        futures = {executor.submit(_process_pyramid_tile, date, z, x, y): (x, y) for x, y in tasks}
+        futures = {executor.submit(_process_pyramid_tile, conn, z, x, y): (x, y) for x, y in tasks}
         for future in concurrent.futures.as_completed(futures):
             future.result()  # re-raise a worker exception on the main thread
             done += 1
@@ -498,7 +461,7 @@ def _generate_pyramid_level(
     return done
 
 
-def _generate_for_date(date: str) -> None:
+def _generate_for_date(date: str, conn: tile_db.TileDb) -> None:
     key = PROCESS_KEY_TEMPLATE.format(date=date)
     try:
         start = time.monotonic()
@@ -521,13 +484,13 @@ def _generate_for_date(date: str) -> None:
                 raise RuntimeError(f"cosmos-snow[{date}]: source GeoTIFF has no CRS - cannot georeference tiles")
 
             xmin, xmax, ymin, ymax = zoom_ranges[MAX_ZOOM]
-            done = _generate_max_zoom_tiles(date, src, xmin, xmax, ymin, ymax, key, total, done, rate)
-        _commit(date)  # flush the tail of this zoom level
+            done = _generate_max_zoom_tiles(conn, src, xmin, xmax, ymin, ymax, key, total, done, rate)
+        conn.commit()  # flush the tail of this zoom level
 
         for z in range(MAX_ZOOM - 1, MIN_ZOOM - 1, -1):
             xmin, xmax, ymin, ymax = zoom_ranges[z]
-            done = _generate_pyramid_level(date, z, xmin, xmax, ymin, ymax, key, total, done, rate)
-            _commit(date)  # flush the tail of this zoom level
+            done = _generate_pyramid_level(conn, z, xmin, xmax, ymin, ymax, key, total, done, rate)
+            conn.commit()  # flush the tail of this zoom level
 
         elapsed = time.monotonic() - start
         processes.finish(key, message=f"{done} tiles in {elapsed:.1f}s")
@@ -535,7 +498,7 @@ def _generate_for_date(date: str) -> None:
     except Exception:
         logger.exception("cosmos-snow[%s]: generation failed", date)
         try:
-            _commit(date)  # persist whatever tiles succeeded before the failure
+            conn.commit()  # persist whatever tiles succeeded before the failure
         except Exception:
             logger.exception("cosmos-snow[%s]: failed to flush partial progress after error", date)
         processes.fail(key, message="generation failed, check server log")

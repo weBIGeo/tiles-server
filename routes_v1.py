@@ -83,7 +83,8 @@ def cosmos_snow_status(date: str):
 
 
 def cosmos_snow_tile(date: str, z: int, x: int, y: int):
-    data = cosmos_snow.get_tile(date, z, x, y)
+    conn = cosmos_snow.get_db(date)
+    data = conn.get_tile(z, x, y) if conn is not None else None
     if data is not None:
         return Response(data, mimetype="image/png")
     if not cosmos_snow.is_ready(date):
