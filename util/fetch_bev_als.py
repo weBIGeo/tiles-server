@@ -74,12 +74,13 @@ def stamp_crs(path: str) -> None:
         ds.crs = CRS.from_epsg(3035)
 
 
-def download_tile(product: str, tile_id: str, out_dir: str) -> None:
+def download_tile(product: str, tile_id: str, out_dir: str) -> str:
+    """Download one tile (skipping if already present) and return its local path."""
     url = tile_url(product, tile_id)
     dst = os.path.join(out_dir, os.path.basename(url))
     if os.path.exists(dst):
         print(f"{tile_id}: exists, skipping")
-        return
+        return dst
     print(f"{tile_id}: {url} -> {dst}")
     tmp = dst + ".part"
     with requests.get(url, stream=True, timeout=60) as r:
@@ -90,6 +91,16 @@ def download_tile(product: str, tile_id: str, out_dir: str) -> None:
     os.replace(tmp, dst)
     stamp_crs(dst)
     print(f"{tile_id}: done")
+    return dst
+
+
+def download_tiles(product: str, tile_ids: list[str], out_dir: str) -> list[str]:
+    """Download several tiles into out_dir, returning their local paths in the
+    same order as tile_ids. Used both by main() and by notebooks (e.g.
+    dtm_fetch_merge_compressor.ipynb) that need a set of tiles fetched
+    programmatically rather than via the CLI."""
+    os.makedirs(out_dir, exist_ok=True)
+    return [download_tile(product, tile_id, out_dir) for tile_id in tile_ids]
 
 
 def main() -> None:
@@ -101,9 +112,7 @@ def main() -> None:
     args = p.parse_args()
 
     tile_ids = args.tiles or TILE_IDS
-    os.makedirs(args.out, exist_ok=True)
-    for tile_id in tile_ids:
-        download_tile(args.product, tile_id, args.out)
+    download_tiles(args.product, tile_ids, args.out)
     print(f"done. {len(tile_ids)} tile(s) in {args.out}/")
 
 
