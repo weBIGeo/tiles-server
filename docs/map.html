@@ -320,8 +320,9 @@
     // poll loop for the newly selected date.
     let snowPollGeneration = 0;
 
-    // Raw R/G-encoded centimeter values (value_cm = R*256+G), not a colormap -
-    // renders as a reddish/greenish raster until a display transform is added.
+    // Raw R=avg/G=min/B=max centimeter values (each channel linearly quantized
+    // 0-CEILING_CM, see cosmos_snow.py's _encode_cm/CEILING_CM), not a colormap -
+    // renders as a raw RGB raster until a display transform is added.
     function createCosmosSnowLayer(date) {
       return L.tileLayer(`./v1/cosmos-snow/${date}/{z}/{x}/{y}.png`, {
         tileSize: 256,

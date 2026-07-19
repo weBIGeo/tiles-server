@@ -75,6 +75,12 @@ MAX_ZOOM = 13
 
 TILE_SIZE = 256
 
+# Ceiling for the avg/min/max snow-depth-in-cm fields encoded into each tile's
+# R/G/B bytes (see _encode_cm/_decode_cm) - 5m, comfortably above the ~416cm
+# max observed in the one real sample date checked so far, with headroom for
+# an unusually extreme snow year. Values above this clamp (lossy).
+CEILING_CM = 500
+
 # TileDb.save_tile() no longer commits on every call (that meant a disk sync
 # per tile - thousands of them per generation run); this is how many saved
 # tiles accumulate before a batch commit, bounding how much work an
@@ -334,60 +340,94 @@ def _read_mosaic_from_raster(
 
 
 # --------------------------------------------------------------------------
+# cm <-> byte quantization (linear, shared by the avg/min/max channels)
+# --------------------------------------------------------------------------
+def _encode_cm(cm: np.ndarray) -> np.ndarray:
+    """Linearly quantize a cm-depth array into a byte, clamped to
+    [0, CEILING_CM] - a uniform ~CEILING_CM/255 (~2cm) step across the whole
+    range."""
+    return np.clip(np.round(cm / CEILING_CM * 255), 0, 255).astype(np.uint8)
+
+
+def _decode_cm(byte: np.ndarray) -> np.ndarray:
+    """Inverse of _encode_cm."""
+    return byte.astype(np.float64) * CEILING_CM / 255
+
+
+# --------------------------------------------------------------------------
 # PNG encode/decode
 # --------------------------------------------------------------------------
-def _encode_tile(value_cm: np.ndarray, valid: np.ndarray) -> bytes:
-    """value_cm: uint16 (256,256) depth in cm. valid: bool (256,256), True
-    where the source pixel was not nodata. R = hi byte, G = lo byte, B = 0,
-    A = 255 where valid and non-zero, else 0 (transparent)."""
-    r = (value_cm >> 8).astype(np.uint8)
-    g = (value_cm & 0xFF).astype(np.uint8)
-    b = np.zeros_like(r)
-    a = np.where(valid & (value_cm != 0), 255, 0).astype(np.uint8)
+def _encode_tile(avg_cm: np.ndarray, min_cm: np.ndarray, max_cm: np.ndarray, valid: np.ndarray) -> bytes:
+    """avg_cm/min_cm/max_cm: depth in cm (256,256), independently quantized
+    into one byte each. valid: bool (256,256), True where the source pixel
+    was not nodata. R = avg, G = min, B = max, A = 255 where valid and
+    non-zero, else 0 (transparent)."""
+    r = _encode_cm(avg_cm)
+    g = _encode_cm(min_cm)
+    b = _encode_cm(max_cm)
+    a = np.where(valid & (avg_cm != 0), 255, 0).astype(np.uint8)
     img = Image.fromarray(np.dstack([r, g, b, a]), mode="RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def _decode_tile(data: bytes) -> tuple[np.ndarray, np.ndarray]:
+def _decode_tile(data: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Inverse of _encode_tile, used only by the mipmap builder below."""
     arr = np.array(Image.open(io.BytesIO(data)).convert("RGBA"))
-    value_cm = (arr[..., 0].astype(np.uint16) << 8) | arr[..., 1].astype(np.uint16)
+    avg_cm = _decode_cm(arr[..., 0])
+    min_cm = _decode_cm(arr[..., 1])
+    max_cm = _decode_cm(arr[..., 2])
     valid = arr[..., 3] > 0
-    return value_cm, valid
+    return avg_cm, min_cm, max_cm, valid
 
 
 # --------------------------------------------------------------------------
 # Mipmap (zoom levels below MAX_ZOOM)
 # --------------------------------------------------------------------------
-def _downsample_2x2(value_cm: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _downsample_2x2(
+    avg_cm: np.ndarray, min_cm: np.ndarray, max_cm: np.ndarray, valid: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """256x256 -> 128x128 box downsample in numeric cm-space. An output pixel
-    is valid if >=1 of its 4 input pixels is valid, and its value is the mean
-    of just the valid ones - so a nodata/void neighbor never drags a real
-    value toward a fake number."""
-    v = value_cm.reshape(128, 2, 128, 2).astype(np.float64)
+    is valid if >=1 of its 4 input pixels is valid; its avg is the mean of
+    just the valid ones (so a nodata/void neighbor never drags a real value
+    toward a fake number), and its min/max are the true min/max of the valid
+    ones - composing exactly through the pyramid (modulo the per-level
+    quantization noise from re-decoding already-encoded bytes)."""
+    a = avg_cm.reshape(128, 2, 128, 2).astype(np.float64)
+    mn = min_cm.reshape(128, 2, 128, 2).astype(np.float64)
+    mx = max_cm.reshape(128, 2, 128, 2).astype(np.float64)
     m = valid.reshape(128, 2, 128, 2)
     count = m.sum(axis=(1, 3))
-    total = np.where(m, v, 0).sum(axis=(1, 3))
+    total = np.where(m, a, 0).sum(axis=(1, 3))
     avg = np.divide(total, count, out=np.zeros_like(total), where=count > 0)
-    return np.round(avg).astype(np.uint16), count > 0
+    out_min = np.where(m, mn, np.inf).min(axis=(1, 3))
+    out_min = np.where(count > 0, out_min, 0)
+    out_max = np.where(m, mx, -np.inf).max(axis=(1, 3))
+    out_max = np.where(count > 0, out_max, 0)
+    return avg, out_min, out_max, count > 0
 
 
-def _compose_parent_tile(children: dict[tuple[int, int], bytes | None]) -> tuple[np.ndarray, np.ndarray]:
+def _compose_parent_tile(
+    children: dict[tuple[int, int], bytes | None]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """children keyed by (dx,dy) in {0,1}x{0,1} (child = parent*2+dx/dy, same
     quadrant convention as debug_ortho's SYNTH_ZOOM step) -> PNG bytes, or
     None if that child tile doesn't exist - treated as a fully
     transparent/nodata quadrant so edges degrade gracefully."""
-    out_value = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint16)
+    out_avg = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.float64)
+    out_min = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.float64)
+    out_max = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.float64)
     out_valid = np.zeros((TILE_SIZE, TILE_SIZE), dtype=bool)
     for (dx, dy), data in children.items():
         if data is None:
             continue
-        qv, qm = _downsample_2x2(*_decode_tile(data))
-        out_value[dy * 128:(dy + 1) * 128, dx * 128:(dx + 1) * 128] = qv
+        qa, qmn, qmx, qm = _downsample_2x2(*_decode_tile(data))
+        out_avg[dy * 128:(dy + 1) * 128, dx * 128:(dx + 1) * 128] = qa
+        out_min[dy * 128:(dy + 1) * 128, dx * 128:(dx + 1) * 128] = qmn
+        out_max[dy * 128:(dy + 1) * 128, dx * 128:(dx + 1) * 128] = qmx
         out_valid[dy * 128:(dy + 1) * 128, dx * 128:(dx + 1) * 128] = qm
-    return out_value, out_valid
+    return out_avg, out_min, out_max, out_valid
 
 
 # --------------------------------------------------------------------------
@@ -404,7 +444,9 @@ def _process_mosaic_tile(
     col0 = (x - xmin) * TILE_SIZE
     value_cm = value_cm_mosaic[row0:row0 + TILE_SIZE, col0:col0 + TILE_SIZE]
     valid = valid_mosaic[row0:row0 + TILE_SIZE, col0:col0 + TILE_SIZE]
-    conn.save_tile(MAX_ZOOM, x, y, _encode_tile(value_cm, valid))
+    # A leaf (MAX_ZOOM) texel is one real measured sample - no aggregation
+    # yet, so avg == min == max.
+    conn.save_tile(MAX_ZOOM, x, y, _encode_tile(value_cm, value_cm, value_cm, valid))
 
 
 def _generate_max_zoom_tiles(
@@ -439,8 +481,8 @@ def _process_pyramid_tile(conn: tile_db.TileDb, z: int, x: int, y: int) -> None:
         (dx, dy): conn.get_tile(z + 1, x * 2 + dx, y * 2 + dy)
         for dx in (0, 1) for dy in (0, 1)
     }
-    value_cm, valid = _compose_parent_tile(children)
-    conn.save_tile(z, x, y, _encode_tile(value_cm, valid))
+    avg_cm, min_cm, max_cm, valid = _compose_parent_tile(children)
+    conn.save_tile(z, x, y, _encode_tile(avg_cm, min_cm, max_cm, valid))
 
 
 def _generate_pyramid_level(
