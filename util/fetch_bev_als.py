@@ -40,8 +40,11 @@ import argparse
 import os
 
 import rasterio
+import rasterio.warp
 import requests
 from rasterio.crs import CRS
+
+TILE_SIZE_M = 50_000
 
 TILE_IDS = [
     "N2550000E4650000",
@@ -67,6 +70,19 @@ BASE_URL = "https://data.bev.gv.at/download/ALS"
 
 def tile_url(product: str, tile_id: str) -> str:
     return f"{BASE_URL}/{product}/20250915/ALS_{product}_CRS3035RES50000m{tile_id}.tif"
+
+
+def point_to_tile_id(lat: float, lon: float) -> str:
+    """WGS84 lat/lon -> the BEV ALS tile ID (50x50km grid, SW-corner-named) that
+    contains it. Doesn't handle points near a tile border - just picks the single
+    containing tile."""
+    (easting,), (northing,) = rasterio.warp.transform("EPSG:4326", "EPSG:3035", [lon], [lat])
+    sw_easting = int(easting // TILE_SIZE_M) * TILE_SIZE_M
+    sw_northing = int(northing // TILE_SIZE_M) * TILE_SIZE_M
+    tile_id = f"N{sw_northing}E{sw_easting}"
+    if tile_id not in TILE_IDS:
+        raise ValueError(f"({lat}, {lon}) -> {tile_id}, which is outside the known Austria tile coverage")
+    return tile_id
 
 
 def stamp_crs(path: str) -> None:
