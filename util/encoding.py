@@ -160,6 +160,17 @@ def oct_to_normal(e: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------
 def angle_between_deg(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Angle in degrees between two arrays of (..., 3) unit vectors. Used to
-    quantify an encoding's round-trip error against the source normals."""
-    dot = np.clip(np.sum(np.asarray(a) * np.asarray(b), axis=-1), -1.0, 1.0)
-    return np.degrees(np.arccos(dot))
+    quantify an encoding's round-trip error against the source normals.
+
+    Deliberately NOT arccos(dot). For nearly-parallel vectors arccos is badly
+    conditioned - arccos(1-d) ~= sqrt(2d), so an error d in the dot product
+    blows up to sqrt(2d) in the angle. With a float32 dot that puts a floor of
+    ~0.028 degrees on anything this can measure, which is coarser than the error
+    of a 16-bit encoding: comparing a vector to *itself* would report up to
+    0.044 degrees. The chord form below is exact for unit vectors and stays
+    well-conditioned at small angles; float64 keeps the input rounding out of
+    the result too."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    chord = np.linalg.norm(a - b, axis=-1)
+    return np.degrees(2.0 * np.arcsin(np.clip(chord / 2.0, 0.0, 1.0)))
