@@ -29,11 +29,12 @@
 #     the whole square instead - sqrt(2) better precision for free, and no
 #     octahedral fold inside the sampled domain, so GPU bilinear filtering of the
 #     texture is always safe.
-#   - 8 bits per component costs 0.24 degrees mean / 0.55 degrees max error
-#     (measured over a uniform hemisphere; plain oct is 0.34 / 0.94 for the same
-#     8 bits). That is roughly 10x below the ~5 degree noise floor of normals
-#     derived from 1m ALS data, so 16 bits would measure nothing real while
-#     roughly doubling the tile size.
+#   - 8 bits per component costs 0.26 degrees mean / 0.55 degrees max on real
+#     alpine z17 data (plain oct is 0.36 / 0.94 for the same 8 bits). Two honest
+#     gradient estimators of the same surface - finite difference and Sobel -
+#     disagree by 0.77 degrees mean / 3.3 degrees p99 on that same tile, so the
+#     quantization sits well under what the data actually pins down. 16 bits
+#     costs 2.4x the bytes to reach 0.0014 degrees, which measures nothing real.
 #   - Quantization is centred on 127 with a half-range of 127 (codes 0..254) rather
 #     than the conventional round((e*0.5+0.5)*255), so that e=0 - a perfectly flat
 #     surface - round-trips exactly instead of coming back tilted by 0.225 degrees.
