@@ -24,7 +24,8 @@ import re
 # I know its weird, but its one single line of truth - and i keep forgetting to bump it.
 def read_version() -> str:
     try:
-        readme = os.path.join(os.path.dirname(__file__), "README.md")
+        # ../README.md - this module lives in util/, the README at the repo root.
+        readme = os.path.join(os.path.dirname(os.path.dirname(__file__)), "README.md")
         with open(readme, encoding="utf-8") as f:
             m = re.search(r"img\.shields\.io/badge/version-([^-]+)-", f.read())
             if m:

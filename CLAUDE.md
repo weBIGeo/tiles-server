@@ -49,7 +49,9 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
 - **db.py** — single shared SQLite connection (`check_same_thread=False` + a
   `threading.Lock`) for the main tiles DB. No tables exist yet; schema is added here
   as tile processing is built out.
-- **tile_db.py** — `TileDb`, a thread-safe SQLite-backed tile cache shared by
+- **const.py** — shared constants that aren't deployment config. Currently `BBOXES`,
+  named WGS84 bounding boxes (Austria, Vienna, Schneeberg) as `(w, s, e, n)`.
+- **util/tile_db.py** — `TileDb`, a thread-safe SQLite-backed tile cache shared by
   `tile_creators/*` modules (a separate concept from `db.py`'s single main-app db,
   since each tile source has its own cache file(s)). Owns its own connection, lock,
   and commit-batching counter, opens with `PRAGMA journal_mode=WAL` +
@@ -86,23 +88,44 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
     until ready). This module is a reference implementation for how a "tile source"
     fits together (bbox → tile range → fetch/generate → SQLite cache → serve), useful
     as a pattern when wiring up real data sources (e.g. exolabs/COSMOS).
-- **util.py** — small shared helpers. Notably `read_version()` extracts the version
-  string from the badge in `README.md` (the version is intentionally *not* duplicated
-  in code — bump it only in the README badge).
-- **util/fetch_snow_cover.py** — standalone CLI (not imported by the server) for
-  exploring exolabs/COSMOS snow-depth data: lists products, downloads WMS/XYZ tiles,
-  or fetches/crops the raw S3 GeoTIFFs. Has its own `util/requirements.txt`. See
-  `docs/cosmos-api.md` for the full writeup of the two exolabs access paths (rendered
-  WMS tiles vs. raw GeoTIFF values) and why the raw GeoTIFF is the recommended path for
-  future integration.
+  - **tile_creators/progress.py** — `RateTracker`, the shared windowed "tiles/s"
+    throughput helper the generation loops feed into their `processes.py` messages,
+    so they all report rate the same way. Windowed rather than cumulative because
+    resumed runs skip cached tiles in a burst that would otherwise skew the average.
+- **util/** — shared modules **the server imports**. Anything the server never imports
+  belongs in `scripts/` instead.
+  - **util/general.py** — small shared helpers. Notably `read_version()` extracts the
+    version string from the badge in `README.md` (the version is intentionally *not*
+    duplicated in code — bump it only in the README badge). Note it resolves the README
+    one directory up, since this module lives in `util/`.
+  - **util/encoding.py** — normal-vector encode/decode shared by
+    `tile_creators/als_normals.py` and the playground notebook: hemi-octahedral
+    projection plus the 127-centred 8-bit quantization written into the R/G channels of
+    a normal tile. See `docs/normal_map_encoding.md` for the format and the reasoning.
+- **scripts/** — standalone CLIs and notebooks, **never imported by the server**. They
+  reach `config`/`const` by inserting the repo root on `sys.path`, and have their own
+  `scripts/requirements.txt` separate from the server's.
+  - **scripts/fetch_snow_cover.py** — CLI for exploring exolabs/COSMOS snow-depth data:
+    lists products, downloads WMS/XYZ tiles, or fetches/crops the raw S3 GeoTIFFs. See
+    `docs/cosmos-api.md` for the full writeup of the two exolabs access paths (rendered
+    WMS tiles vs. raw GeoTIFF values) and why the raw GeoTIFF is the recommended path
+    for future integration.
+  - **scripts/fetch_bev_als.py** — CLI for downloading BEV ALS DTM/DSM GeoTIFF tiles
+    (1 m/px, EPSG:3035, 50×50 km per tile) and stamping the CRS the downloads omit.
+  - **scripts/normal_map_playground.ipynb** — exploratory notebook for terrain normals:
+    reprojects DTM/DSM into a single slippy tile, compares gradient methods, and
+    measures the encoding in `util/encoding.py`.
 - **docs/index.html** — the landing page served at `/`.
 - **docs/map.html** — Leaflet map served at `/map`, viewing the `debug_ortho` tileset.
 - **docs/cosmos-api.md** — research notes on the exolabs/COSMOS snow data API,
-  companion to `util/fetch_snow_cover.py`.
+  companion to `scripts/fetch_snow_cover.py`.
 
 ## Conventions worth preserving
 
 - Every source file starts with the GPLv3 header block; keep it on new files.
+- `util/` vs `scripts/`: a module the server imports goes in `util/` (imported as
+  `from util import general`); a standalone CLI or notebook the server never touches
+  goes in `scripts/`. Nothing in `util/` may import from `scripts/`.
 - Config values are always read as `config.<name>`, with sensible fallback via
   `getattr(config, "name", default)` for optional/notification-related settings so
   `config.py` can omit them entirely.

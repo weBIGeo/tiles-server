@@ -39,7 +39,7 @@ from const import BBOXES
 
 import config
 import processes
-import tile_db
+from util import tile_db
 from tile_creators import progress
 
 logger = logging.getLogger(__name__)

@@ -17,13 +17,13 @@
 #############################################################################
 
 import processes
-import util
+from util import general
 from tile_creators import cosmos_snow, debug_ortho
 from flask import Blueprint, Response, abort, jsonify
 
 bp = Blueprint("v1", __name__, url_prefix="/v1")
 
-VERSION = util.read_version()
+VERSION = general.read_version()
 
 # Possible status values. Only IDLE is ever returned for now; WORKING will be
 # used once tile processing logic is added.

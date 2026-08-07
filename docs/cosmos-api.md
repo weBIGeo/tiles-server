@@ -1,7 +1,7 @@
 # exolabs / COSMOS snow data — access notes
 
 Findings from probing the exolabs COSMOS service for snow-depth data over the Alps.
-Companion to the standalone tool [`util/fetch_snow_cover.py`](../util/fetch_snow_cover.py).
+Companion to the standalone tool [`scripts/fetch_snow_cover.py`](../scripts/fetch_snow_cover.py).
 
 - Official docs: <https://exolabs-ch.gitbook.io/cosmos>
 - Credentials live in the git-ignored `config.py` (placeholders in `config.example.py`).
@@ -91,10 +91,10 @@ yourself:
 ## The tool
 
 ```bash
-python util/fetch_snow_cover.py list
-python util/fetch_snow_cover.py tiles --product "snowdepth map - alps" --zoom 10
-python util/fetch_snow_cover.py tif --crop-austria --out data/exolabs
+python scripts/fetch_snow_cover.py list
+python scripts/fetch_snow_cover.py tiles --product "snowdepth map - alps" --zoom 10
+python scripts/fetch_snow_cover.py tif --crop-austria --out data/exolabs
 ```
 
-Standalone, not wired into the tiles-server. Deps in `util/requirements.txt`
+Standalone, not wired into the tiles-server. Deps in `scripts/requirements.txt`
 (`requests`, `boto3`, optional GDAL).

@@ -27,7 +27,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 import processes
-import tile_db
+from util import tile_db
 from tile_creators import progress
 
 logger = logging.getLogger(__name__)

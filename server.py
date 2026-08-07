@@ -20,7 +20,7 @@ import logging
 import os
 import config
 import log_config
-import util
+from util import general
 import db
 from tile_creators import cosmos_snow, debug_ortho
 import notify
@@ -31,7 +31,7 @@ from waitress import serve
 
 logger = logging.getLogger("server")
 
-VERSION = util.read_version()
+VERSION = general.read_version()
 
 app = Flask(__name__)
 CORS(app)
