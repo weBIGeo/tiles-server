@@ -265,6 +265,55 @@
       </div>
     </div>
 
+    <div class="card mb-3 mt-4">
+      <div class="card-header">ALS surface normals</div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Surface-normal tiles derived from one BEV ALS height raster — a DTM
+          or a DSM, whichever <code>TILE_SOURCE</code> in <code>tile_creators/als_normals.py</code> points at.
+          Generation starts on server boot whenever that file exists, in the background, and restarts from
+          scratch on every boot (there is no resume). Progress shows up in Background processes above, and
+          tiles are servable on the <a href="./map">map</a> as they land rather than only at the end.</p>
+        <div class="small text-secondary" id="als-status">checking…</div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/als-normals/status</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Readiness of the normal tileset: <code>generating</code>,
+          <code>ready</code>, <code>error</code>, or <code>unknown</code> when the source raster is missing so
+          nothing was started. Also reports the source file, its WGS84 bounds and the zoom range, none of which
+          a client can discover from the tiles themselves.</p>
+        <pre class="border rounded p-3 small mb-0"><code>{
+  "status": "ready",
+  "source": "ALS_DSM_CRS3035RES50000mN2650000E4500000.tif",
+  "bounds": [12.31, 46.87, 12.97, 47.33],
+  "min_zoom": 0,
+  "max_zoom": 17
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/als-normals/&lt;z&gt;/&lt;x&gt;/&lt;y&gt;.png</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Surface normals in the ENU frame (+X east, +Y north, +Z up),
+          hemi-octahedrally projected and quantized to 8 bits per component:
+          <code>R,G = round(e * 127) + 127</code>, blue reserved and zero, no alpha. Voids read as the flat
+          normal <code>(127, 127, 0)</code> rather than carrying a validity mask. Returns
+          <code>image/png</code> on success, <code>503</code> while the tileset is still generating, and
+          <code>404</code> once it's ready for any tile outside the source raster's footprint — which is the
+          expected state for the corners of a rotated EPSG:3035 tile, not an error.</p>
+        <a href="./map" class="btn btn-sm btn-outline-primary">🗺️ View these tiles on a map &rarr;</a>
+      </div>
+    </div>
+
   </div>
 
   <script>
@@ -354,6 +403,29 @@
         resultEl.textContent = 'Could not reach the server.';
       }
     });
+
+    // === ALS SURFACE NORMALS ===
+    // Status only - generation starts itself on server boot. The live progress
+    // bar is the Background processes card above.
+    const alsStatusEl = document.getElementById('als-status');
+
+    async function pollAls() {
+      try {
+        const info = await fetch('./v1/als-normals/status').then(r => r.json());
+        const b = info.bounds;
+        const where = b
+          ? `${b[1].toFixed(2)}–${b[3].toFixed(2)}°N, ${b[0].toFixed(2)}–${b[2].toFixed(2)}°E`
+          : 'source unreadable';
+        alsStatusEl.textContent =
+          `${info.status} — ${info.source} · z${info.min_zoom}–z${info.max_zoom} · ${where}`;
+        if (info.status === 'ready' || info.status === 'unknown') return; // nothing left to watch
+      } catch {
+        alsStatusEl.textContent = 'could not reach the server';
+      }
+      setTimeout(pollAls, 3000);
+    }
+
+    pollAls();
   </script>
 </body>
 

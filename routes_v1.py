@@ -18,7 +18,7 @@
 
 import processes
 from util import general
-from tile_creators import cosmos_snow, debug_ortho
+from tile_creators import als_normals, cosmos_snow, debug_ortho
 from flask import Blueprint, Response, abort, jsonify
 
 bp = Blueprint("v1", __name__, url_prefix="/v1")
@@ -96,3 +96,36 @@ bp.add_url_rule("/cosmos-snow/dates", view_func=cosmos_snow_dates)
 bp.add_url_rule("/cosmos-snow/<date>/generate", view_func=cosmos_snow_generate, methods=["POST"])
 bp.add_url_rule("/cosmos-snow/<date>/status", view_func=cosmos_snow_status)
 bp.add_url_rule("/cosmos-snow/<date>/<int:z>/<int:x>/<int:y>.png", view_func=cosmos_snow_tile)
+
+
+def als_normals_status():
+    """Also reports the source name, its WGS84 bounds and MAX_ZOOM - a client
+    can't discover any of them from the tiles alone, and needs the bounds to
+    find a single 50km footprint and MAX_ZOOM to set maxNativeZoom."""
+    return jsonify({
+        "status": als_normals.get_status(),
+        "source": als_normals.source_name(),
+        "bounds": als_normals.source_bounds(),
+        "min_zoom": als_normals.MIN_ZOOM,
+        "max_zoom": als_normals.MAX_ZOOM,
+    })
+
+
+def als_normals_tile(z: int, x: int, y: int):
+    """Serves whatever is in the db right now, generated or not - a run writes
+    tiles as it goes, so a partially built tileset is viewable while it builds
+    instead of being withheld until the end."""
+    conn = als_normals.get_db()
+    data = conn.get_tile(z, x, y) if conn is not None else None
+    if data is not None:
+        return Response(data, mimetype="image/png")
+    if not als_normals.is_ready():
+        return jsonify({"error": "this als normal tile has not been generated yet"}), 503
+    # Generation finished and this tile still isn't there: it's outside the
+    # source raster's footprint, which is normal for the corners of a
+    # non-axis-aligned EPSG:3035 tile rather than an error.
+    abort(404)
+
+
+bp.add_url_rule("/als-normals/status", view_func=als_normals_status)
+bp.add_url_rule("/als-normals/<int:z>/<int:x>/<int:y>.png", view_func=als_normals_tile)

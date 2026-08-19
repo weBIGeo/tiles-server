@@ -72,6 +72,13 @@ class TileDb:
             ).fetchone()
         return row is not None
 
+    def has_tiles(self) -> bool:
+        """Whether the db already holds any tile at all - lets a caller with
+        no per-tile resume logic decide to skip a whole generation run."""
+        with self._lock:
+            row = self._conn.execute("SELECT 1 FROM tiles LIMIT 1").fetchone()
+        return row is not None
+
     def save_tile(self, z: int, x: int, y: int, data: bytes) -> None:
         """Inserts/replaces the tile. Commits automatically every
         `commit_batch_size` saves (default: every save) - callers never

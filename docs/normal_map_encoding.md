@@ -175,6 +175,23 @@ It costs one unused code (255) and a 0.4% coarser step.
   that constraint is a number rather than a guess.
 - **Lossy anything.** These bytes are vector components, not pixels; a codec
   optimizing perceptual image similarity has no idea it is destroying geometry.
+- **BC5.** A GPU block-compression format built for exactly this shape of data
+  (two independent 8-bit channels), decoded by sampling hardware instead of a
+  CPU-side PNG inflate — worth a number rather than a guess given it's the
+  standard normal-map texture format. No encoder was available to measure it
+  directly, so `scripts/normal_map_playground.ipynb` (§7) simulates the
+  algorithm: each 4x4 block re-quantized to 8 values interpolated between that
+  block's own min and max. Two problems, both measured on real alpine z17
+  data: it only saves 31% over the already-compressed PNG (a fixed 65,536 B vs
+  ~94,415 B — BC5 is fixed-rate, so it can't adapt to flat regions the way PNG
+  does, and would lose outright on the 38 KB urban DTM case above), and the
+  per-block quantization pushes error to 1.17° mean / 5.49° p99 / 12.7° max —
+  *past* the 0.77° / 3.35° / 9.23° finite-diff-vs-Sobel noise floor that
+  justified 8 bits per component in the first place, because a block's own
+  min/max range gets inflated by the same near-random low-byte noise that
+  makes this data resist PNG compression. It would also be a bigger lift than
+  a codec swap: real GPU-texture loading (KTX2 or similar) in the renderer,
+  not an image decoder.
 
 ## Pitfall: don't measure angular error with `arccos(dot)`
 

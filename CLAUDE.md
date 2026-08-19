@@ -57,8 +57,8 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
   and commit-batching counter, opens with `PRAGMA journal_mode=WAL` +
   `PRAGMA synchronous=NORMAL`, and creates the standard `tiles(z, x, y, data)` table —
   so a tile source never touches `sqlite3` directly, it just calls `get_tile`/
-  `save_tile`/`tile_exists`/`commit`. Used by `tile_creators/cosmos_snow.py` and
-  `tile_creators/debug_ortho.py`.
+  `save_tile`/`tile_exists`/`commit`. Used by `tile_creators/als_normals.py`,
+  `tile_creators/cosmos_snow.py` and `tile_creators/debug_ortho.py`.
 - **log_config.py** — custom colored logging formatter matching the style used across
   weBIGeo projects (see the C++ formatter it mirrors, linked in the module). Sets up
   console + rotating file handlers and per-logger level overrides from
@@ -76,6 +76,23 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
   and, unlike the rest of the app, its own tunables as module-level constants rather
   than entries in `config.py` — these are implementation details of one tile source,
   not deployment config).
+  - **tile_creators/als_normals.py** — surface-normal tiles from a BEV ALS height
+    raster. Deliberately agnostic to DTM vs DSM: it processes whatever single GeoTIFF
+    `TILE_SOURCE` points at, and `DB_PATH` is derived from that filename so the two
+    products can't end up interleaved in one db. Coverage comes from the raster's own
+    bounds (a 50 km EPSG:3035 tile is a rotated quad in the 3857 tile grid, so
+    all-nodata corner tiles are skipped rather than written flat). Per tile: reproject
+    → Web Mercator altitude correction (per destination row) → 3×3 gradient →
+    `util/encoding.py` → RGB PNG. `init()` starts a background daemon thread whenever
+    `TILE_SOURCE` exists, like `debug_ortho`; there is **no resume**, so every boot
+    regenerates every tile. Tiles are servable as they land — `/v1/als-normals/...`
+    returns whatever is in the db right now and only 503s per missing tile. Its
+    pyramid is the one deliberate divergence from `cosmos_snow.py`: parents are
+    reduced from the exact
+    **float** normal field block-by-block (`BLOCK_ZOOM` bounds peak memory), never by
+    re-decoding already-quantized children, so quantization error doesn't compound
+    down the levels. Format spec: `docs/normal_map_encoding.md`; the `MAX_ZOOM`
+    reasoning: `docs/max_zoomlevel_normal_height_maps.md`.
   - **tile_creators/debug_ortho.py** — a self-contained synthetic/debug tile source:
     downloads real basemap.at orthophoto tiles over Vienna's 1st district into its own
     SQLite db (`DB_PATH`, separate from the main db), labels each tile with its z/x/y,
@@ -116,7 +133,11 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
     reprojects DTM/DSM into a single slippy tile, compares gradient methods, and
     measures the encoding in `util/encoding.py`.
 - **docs/index.html** — the landing page served at `/`.
-- **docs/map.html** — Leaflet map served at `/map`, viewing the `debug_ortho` tileset.
+- **docs/map.html** — Leaflet map served at `/map`, with a drag-reorderable overlay
+  stack: the `debug_ortho` tileset, the date-selectable COSMOS snow layer, and the ALS
+  normals. Every layer renders its tiles as-is, with no client-side decoding — the
+  point of the page is to see what the server actually stored. Generation triggers and
+  progress live on `docs/index.html`, not here.
 - **docs/cosmos-api.md** — research notes on the exolabs/COSMOS snow data API,
   companion to `scripts/fetch_snow_cover.py`.
 

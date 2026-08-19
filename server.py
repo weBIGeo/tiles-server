@@ -22,7 +22,7 @@ import config
 import log_config
 from util import general
 import db
-from tile_creators import cosmos_snow, debug_ortho
+from tile_creators import als_normals, cosmos_snow, debug_ortho
 import notify
 import routes_v1
 from flask import Flask, send_from_directory
@@ -61,6 +61,7 @@ if __name__ == "__main__":
     db.init(config.db_path)
     debug_ortho.init()
     cosmos_snow.init()
+    als_normals.init()
     msg = f" === weBIGeo Tiles Server v{VERSION} started === "
     sep = " " + "=" * (len(msg) - 2) + " "
     logger.info(sep)

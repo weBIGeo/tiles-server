@@ -101,6 +101,7 @@
     <span class="text-secondary small ms-2">Debug ortho tiles</span>
     <span class="text-secondary small ms-4 me-2">Snow date:</span>
     <select id="snow-date-select" class="form-select form-select-sm" style="width:auto"></select>
+    <button id="als-zoom" class="btn btn-sm btn-outline-secondary ms-4" type="button" disabled>ALS normals: zoom to coverage</button>
   </nav>
 
   <div id="map"></div>
@@ -410,6 +411,75 @@
 
     snowDateSelect.addEventListener('change', () => selectSnowDate(snowDateSelect.value));
     loadSnowDates();
+
+    // === ALS NORMALS ===
+    // The encoded PNGs exactly as stored - no decode, no shading. Starting a run
+    // and reporting its progress belong to the landing page; this page only
+    // views the result.
+    const alsZoomBtn = document.getElementById('als-zoom');
+    let alsBounds = null;  // [w, s, e, n] from the source raster, or null
+    let alsEntry = null;   // its layerEntries element
+
+    async function loadAlsNormals() {
+      let info;
+      try {
+        info = await fetch('./v1/als-normals/status').then(r => r.json());
+      } catch {
+        return; // landing page already reports an unreachable server
+      }
+      alsBounds = info.bounds;
+      // Starts inactive: the coverage is one 50km footprint elsewhere in
+      // Austria, so switching it on over the Vienna default view would just
+      // look broken. The zoom button below turns it on with the jump.
+      alsEntry = {
+        name: `ALS normals (${info.source})`,
+        layer: L.tileLayer('./v1/als-normals/{z}/{x}/{y}.png', {
+          tileSize: 256,
+          minZoom: 0,
+          maxZoom: 21,
+          minNativeZoom: info.min_zoom,
+          maxNativeZoom: info.max_zoom,
+          attribution: 'Normals derived from <a href="https://www.bev.gv.at/">BEV</a> ALS',
+        }),
+        active: false,
+      };
+      layerEntries.unshift(alsEntry);
+      layerOrderControl._renderList();
+
+      alsZoomBtn.disabled = !alsBounds;
+      pollAlsUntilReady();
+    }
+
+    // Deliberately silent: no banner, no button - status belongs to the landing
+    // page. Generation writes tiles as it goes, so this redraws the layer on
+    // every tick to pull in whatever has landed since, and stops once ready.
+    // Only while the layer is switched on, so an unused layer costs nothing.
+    async function pollAlsUntilReady() {
+      try {
+        const { status } = await fetch('./v1/als-normals/status').then(r => r.json());
+        if (alsEntry && alsEntry.active) alsEntry.layer.redraw();
+        if (status === 'ready' || status === 'unknown') return; // nothing more will land
+      } catch {
+        return;
+      }
+      setTimeout(pollAlsUntilReady, 5000);
+    }
+
+    alsZoomBtn.addEventListener('click', () => {
+      if (!alsBounds) return;
+      const [w, s, e, n] = alsBounds;
+      map.fitBounds([[s, w], [n, e]]);
+      // Switch the layer on with the jump, otherwise arriving at the coverage
+      // looks identical to not having arrived.
+      if (alsEntry && !alsEntry.active) {
+        alsEntry.active = true;
+        map.addLayer(alsEntry.layer);
+        applyLayerOrder();
+        layerOrderControl._renderList();
+      }
+    });
+
+    loadAlsNormals();
   </script>
 </body>
 
