@@ -102,6 +102,13 @@
     <span class="text-secondary small ms-4 me-2">Snow date:</span>
     <select id="snow-date-select" class="form-select form-select-sm" style="width:auto"></select>
     <button id="als-zoom" class="btn btn-sm btn-outline-secondary ms-4" type="button" disabled>ALS normals: zoom to coverage</button>
+    <select id="als-channel-select" class="form-select form-select-sm ms-2" style="width:auto" disabled>
+      <option value="rgba">ALS normals: RGBA</option>
+      <option value="0">ALS normals: R (normal x)</option>
+      <option value="1">ALS normals: G (normal y)</option>
+      <option value="2">ALS normals: B (roughness)</option>
+      <option value="3">ALS normals: A (snow steepness)</option>
+    </select>
   </nav>
 
   <div id="map"></div>
@@ -417,38 +424,87 @@
     // and reporting its progress belong to the landing page; this page only
     // views the result.
     const alsZoomBtn = document.getElementById('als-zoom');
+    const alsChannelSelect = document.getElementById('als-channel-select');
     let alsBounds = null;  // [w, s, e, n] from the source raster, or null
+    let alsInfo = null;    // status response, needed to rebuild the layer on channel switch
     let alsEntry = null;   // its layerEntries element
 
+    // Renders one raw RGBA channel of the encoded tile as grayscale, so R/G
+    // (hemi-oct normal xy), B (Toksvig roughness) and A (snow steepness
+    // visibility) can each be sanity-checked against util/encoding.py's
+    // encode_tile. No decoding math - just isolating a byte per pixel.
+    const ChannelLayer = L.GridLayer.extend({
+      createTile: function (coords, done) {
+        const tile = document.createElement('canvas');
+        const size = this.getTileSize();
+        tile.width = size.x;
+        tile.height = size.y;
+        const ctx = tile.getContext('2d');
+        const channel = this.options.channel; // 0=R 1=G 2=B 3=A
+        const img = new Image();
+        img.onload = () => {
+          ctx.drawImage(img, 0, 0, size.x, size.y);
+          const data = ctx.getImageData(0, 0, size.x, size.y);
+          const px = data.data;
+          for (let i = 0; i < px.length; i += 4) {
+            const v = px[i + channel];
+            px[i] = px[i + 1] = px[i + 2] = v;
+            px[i + 3] = 255;
+          }
+          ctx.putImageData(data, 0, 0);
+          done(null, tile);
+        };
+        img.onerror = () => done(null, tile); // missing tile -> blank
+        img.src = L.Util.template('./v1/als-normals/{z}/{x}/{y}.png', coords);
+        return tile;
+      },
+    });
+
+    function createAlsLayer(channel) {
+      const opts = {
+        tileSize: 256,
+        minZoom: 0,
+        maxZoom: 21,
+        minNativeZoom: alsInfo.min_zoom,
+        maxNativeZoom: alsInfo.max_zoom,
+        attribution: 'Normals derived from <a href="https://www.bev.gv.at/">BEV</a> ALS',
+      };
+      return channel === 'rgba'
+        ? L.tileLayer('./v1/als-normals/{z}/{x}/{y}.png', opts)
+        : new ChannelLayer({ ...opts, channel: Number(channel) });
+    }
+
     async function loadAlsNormals() {
-      let info;
       try {
-        info = await fetch('./v1/als-normals/status').then(r => r.json());
+        alsInfo = await fetch('./v1/als-normals/status').then(r => r.json());
       } catch {
         return; // landing page already reports an unreachable server
       }
-      alsBounds = info.bounds;
+      alsBounds = alsInfo.bounds;
       // Starts inactive: the coverage is one 50km footprint elsewhere in
       // Austria, so switching it on over the Vienna default view would just
       // look broken. The zoom button below turns it on with the jump.
       alsEntry = {
-        name: `ALS normals (${info.source})`,
-        layer: L.tileLayer('./v1/als-normals/{z}/{x}/{y}.png', {
-          tileSize: 256,
-          minZoom: 0,
-          maxZoom: 21,
-          minNativeZoom: info.min_zoom,
-          maxNativeZoom: info.max_zoom,
-          attribution: 'Normals derived from <a href="https://www.bev.gv.at/">BEV</a> ALS',
-        }),
+        name: `ALS normals (${alsInfo.source})`,
+        layer: createAlsLayer('rgba'),
         active: false,
       };
       layerEntries.unshift(alsEntry);
       layerOrderControl._renderList();
 
       alsZoomBtn.disabled = !alsBounds;
+      alsChannelSelect.disabled = false;
       pollAlsUntilReady();
     }
+
+    alsChannelSelect.addEventListener('change', () => {
+      if (!alsEntry) return;
+      const wasActive = alsEntry.active;
+      if (map.hasLayer(alsEntry.layer)) map.removeLayer(alsEntry.layer);
+      alsEntry.layer = createAlsLayer(alsChannelSelect.value);
+      if (wasActive) map.addLayer(alsEntry.layer);
+      applyLayerOrder();
+    });
 
     // Deliberately silent: no banner, no button - status belongs to the landing
     // page. Generation writes tiles as it goes, so this redraws the layer on
