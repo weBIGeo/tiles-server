@@ -8,17 +8,25 @@ on a real z17 tile over the Großglockner (65,536 px, BEV ALS DTM and DSM).
 
 ## TL;DR
 
-**Hemi-octahedral projection, 127-centred 8-bit quantization, R/G of an RGB PNG.**
+**Hemi-octahedral projection, 127-centred 8-bit quantization, R/G of an RGBA
+PNG. B and A carry two more per-pixel quantities, plain 0..255 unorm.**
 
 | channel | contents |
 |---|---|
 | R | hemi-oct `e.x`, `round(e.x * 127) + 127` — codes 0..254 |
 | G | hemi-oct `e.y`, same mapping |
-| B | 0 — reserved |
-| — | no alpha channel |
+| B | Toksvig roughness factor `L`, `round(L * 255)` — see "Roughness & snow visibility" below |
+| A | snow steepness visibility, `round(v * 255)` — see "Roughness & snow visibility" below |
 
-Two bytes per pixel of real data. Costs 0.26° mean / 0.55° max angular error,
-against a data uncertainty of 0.77° mean / 3.3° p99. A 256×256 tile is ~94 KB.
+Two bytes per pixel of geometry (R/G). Costs 0.26° mean / 0.55° max angular
+error, against a data uncertainty of 0.77° mean / 3.3° p99. B and A add two
+more bytes each carrying an independent per-pixel scalar. A 256×256 tile is
+~94 KB at R/G-only (see "Storage" below for the RGBA figure).
+
+Putting real data in alpha overrides this doc's own general rejection of
+that (see "Rejected alternatives") — deliberately, and only for this format.
+The reasoning is spelled out where that rejection is stated, not silently
+contradicted.
 
 ## Frame convention
 
@@ -57,19 +65,117 @@ byte = round(e * 127) + 127            // 0..254, symmetric about 127
 
 Decoding in WGSL. Note the `* 255.0`: an `rgba8unorm` fetch has already divided
 by 255, and that has to be undone before the 127-centred mapping is reversed.
+B and A are plain `[0,1]` unorm already once fetched — no undo needed there.
 
 ```wgsl
-// Decodes a normal-tile texel into an ENU surface normal (+X east, +Y north, +Z up).
-// tex: an rgba8unorm sample of the tile. Only .rg carry data.
+// Decodes a normal-tile texel into an ENU surface normal (+X east, +Y north,
+// +Z up), a Toksvig roughness factor, and a snow visibility fraction.
+// tex: an rgba8unorm sample of the tile.
 fn normal_tile_to_v3f32(tex: vec4<f32>) -> vec3<f32> {
     let e: vec2<f32> = (tex.rg * 255.0 - 127.0) / 127.0;
     let t: vec2<f32> = vec2<f32>(e.x + e.y, e.x - e.y) * 0.5;
     return normalize(vec3<f32>(t, 1.0 - abs(t.x) - abs(t.y)));
 }
+
+fn normal_tile_roughness(tex: vec4<f32>) -> f32 {
+    return tex.b; // Toksvig factor L: 1.0 = smooth/coherent, 0.0 = fully divergent
+}
+
+fn normal_tile_snow_visibility(tex: vec4<f32>) -> f32 {
+    return tex.a; // fraction of the underlying area within the snow-visible band
+}
 ```
 
-Pixels with no valid source data are written as the flat normal `(0,0,1)` →
-`(127, 127, 0)`. There is no validity mask: a void reads as flat ground.
+Pixels with no valid source data are written as the flat normal `(0,0,1)`,
+full roughness factor and full snow visibility → `(127, 127, 255, 255)`.
+There is no separate validity mask: a void reads as flat, smooth,
+snow-visible ground.
+
+## Roughness & snow visibility
+
+### Why B and A exist
+
+Building a coarser pyramid level averages four child normals together. That
+average has to be renormalized back to a unit vector before it can be stored
+as a direction — but the *length* of the average before renormalizing is
+thrown away, and it is not nothing: it is exactly a measure of how much the
+four children agreed. Four children pointing the same way average to a
+vector of length ~1; four children pointing in wildly different directions
+average to something much shorter. This is the classic "Toksvig factor"
+(Toksvig, *Mipmapping Normal Maps*, 2004) — the standard real-time-rendering
+signal for fading in extra roughness at coarse mip levels to suppress
+specular popping, since a coarse texel's stored direction is otherwise a
+smoothed lie about terrain that is actually rough underneath it.
+
+B stores that factor, `L`, directly (not a pre-baked roughness/specular-power
+conversion — the shader decides how to turn `L` into an actual BRDF
+parameter). A stores a related but distinct quantity: what fraction of the
+area under a coarse texel would actually show snow, given the shader's
+existing steepness-based visibility band. Both need the same underlying
+machinery — a pyramid reduction that does not throw information away before
+it's needed — so they're documented together.
+
+### Leaf-count-weighted reduction, not "count of valid children"
+
+The natural-looking shortcut — weight a 2×2 reduction step by how many of
+*its own* 4 immediate children were valid — is not exact once validity is
+non-uniform deeper in the tree. Worked counterexample: quadrant A has 4 valid
+leaves averaging to `(1,0,0)`; quadrant B has 1 valid leaf `(0,1,0)` and 3
+invalid; C and D are fully invalid. The true 5-leaf mean is
+`(4·(1,0,0) + 1·(0,1,0)) / 5 = (0.8, 0.2, 0)`. Naively averaging the two
+valid quadrants as if they carried equal weight gives
+`((1,0,0) + (0,1,0)) / 2 = (0.5, 0.5, 0)` — wrong, because a quadrant with
+one surviving leaf gets to outvote a quadrant with four.
+
+The fix is to track the *exact* number of MAX_ZOOM leaves under every pixel
+(`count`), not a per-step 0..4 tally, and combine four children by:
+
+```
+count_parent = count_1 + count_2 + count_3 + count_4
+mean_parent  = (count_1·mean_1 + count_2·mean_2 + count_3·mean_3 + count_4·mean_4) / count_parent
+```
+
+This is exact by induction: a leaf has `count=1` (or `0` if invalid) and
+`mean` equal to itself; if every child is exact for its own subtree,
+`count_i·mean_i` is exactly that subtree's leaf-vector *sum*, so the formula
+above is exactly `sum(all leaves) / count(all leaves)` for the combined
+subtree. `tile_creators/als_normals.py`'s `_reduce_2x` implements this for
+both the mean normal and the snow-visibility scalar, and never renormalizes
+the mean vector to a unit direction until the final byte-encoding step
+(`util/encoding.py`'s `encode_tile`) — renormalizing any earlier would
+discard `L` before it's ever used.
+
+Two numeric consequences: `count` needs `int64` (a leaf count can reach
+`4**(MAX_ZOOM-MIN_ZOOM)`, e.g. `4**16 ≈ 4.3e9` at today's `MAX_ZOOM=16` —
+already past `uint32`'s ceiling), and the weighted sums need `float64`
+intermediates (at that magnitude, `float32` can no longer represent the
+resulting fractional weights).
+
+`tile_creators/cosmos_snow.py`'s own pyramid reduction *does* use a local
+valid-children count, and that is fine there — it rebuilds each parent from
+already re-quantized children anyway (see its own docstring, "modulo the
+per-level quantization noise"), so it never had an exactness invariant to
+preserve. This format's B channel specifically needs one.
+
+### Snow visibility
+
+At MAX_ZOOM, computed once per leaf directly from the shader's own
+steepness-visibility formula: `1.0` for a slope in
+`[SNOW_ANGLE_MIN, SNOW_ANGLE_MAX]` (0°–45°), linearly ramping to `0` over
+`SNOW_ANGLE_BLEND` (5°) beyond `SNOW_ANGLE_MAX`. The symmetric ramp below
+`SNOW_ANGLE_MIN` is dead in practice — a slope angle from vertical is never
+negative, and `SNOW_ANGLE_MIN` is `0`. These three constants
+(`tile_creators/als_normals.py`) mirror fixed WGSL shader constants and are
+baked into every tile byte: changing them requires regenerating the whole
+tileset. The linear falloff shape is an assumption (the shader's
+`calculate_falloff` body wasn't available to match exactly) — worth
+revisiting if it turns out to be smoothstep or another curve.
+
+At coarser levels, A is the leaf-count-weighted average described above — a
+"fraction of the underlying area that's snow-visible," not a re-evaluation
+of the band formula against an already-averaged direction (which would
+behave very differently on bimodal terrain, e.g. a texel half cliff and half
+flat ground).
 
 ## Why hemi-octahedral
 
@@ -165,12 +271,22 @@ It costs one unused code (255) and a 0.4% coarser step.
   `A=0` unless `exact=True` is passed (see
   [`webp-instead-png.md`](webp-instead-png.md)). A 3-channel RGB tile has no alpha
   to mishandle.
+
+  **Overridden for this format's A channel** (snow steepness visibility, see
+  "Roughness & snow visibility" above): the failure modes above only trigger
+  through a filtered/blended sample, a WebP re-encode, or a canvas round-trip,
+  and none of those apply to this tileset. Its only consumer is a raw WGSL
+  `textureLoad` (never filtered or blended sampling), and it is never
+  re-encoded to WebP or read back through a canvas. If either of those ever
+  becomes true for this tileset, this override needs revisiting, not just the
+  code.
 - **2-channel PNG (grayscale+alpha, colour type 4).** Genuinely tempting: the
   format has only two real channels, and this drops the reserved B channel from
   the file entirely, measurably shrinking tiles. Rejected because it puts the
   second component back in the alpha channel, and because the channel budget is
   wanted open while the format is still being evaluated. Still measured in the
-  notebook.
+  notebook. (Now moot: B and A both carry real data — see "Roughness & snow
+  visibility" above.)
 - **WebP.** The renderer cannot decode it. Measured in the notebook so the cost of
   that constraint is a number rather than a guess.
 - **Lossy anything.** These bytes are vector components, not pixels; a codec
@@ -225,3 +341,14 @@ close to incompressible there — which, together with the 0.77° estimator spre
 suggests a meaningful share of what z17 stores is noise rather than terrain. See
 [`max_zoomlevel_normal_height_maps.md`](max_zoomlevel_normal_height_maps.md) for
 the resolution side of that trade.
+
+The ~94 KB/tile figure above predates the B/A channels and is now a lower
+bound, not current: B and A each add a raw byte per pixel before compression.
+B (Toksvig `L`) should compress well — it's 255 almost everywhere at MAX_ZOOM
+(every leaf starts at `L=1`) and only drops meaningfully once the pyramid
+starts averaging divergent terrain, so it's mostly uniform within a tile. A
+(snow visibility) is terrain-dependent in the same way R/G already are. Not
+re-measured in `scripts/normal_map_playground.ipynb` yet — flagged as a
+follow-up alongside that notebook's `encode_normals`/`decode_normals`/
+`FLAT_NORMAL_RGB` calls, which still use the pre-RGBA API names and need
+updating to `encode_tile`/`decode_tile`/`FLAT_TILE_RGBA`.

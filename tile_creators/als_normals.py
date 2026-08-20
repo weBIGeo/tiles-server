@@ -26,15 +26,20 @@
 #
 # Pipeline per tile: EPSG:3035 source -> reproject to the EPSG:3857 tile grid
 # (+1px apron) -> Web Mercator altitude correction -> 3x3 gradient -> ENU normal
-# -> hemi-octahedral 8:8 in R/G of an RGB PNG (util/encoding.py, spec in
+# -> hemi-octahedral 8:8 in R/G of an RGBA PNG, B = Toksvig roughness factor,
+# A = snow steepness visibility (util/encoding.py, spec in
 # docs/normal_map_encoding.md) -> SQLite via util/tile_db.py.
 #
 # The pyramid is the one place this deliberately diverges from
 # tile_creators/cosmos_snow.py, which builds a parent by re-decoding its four
 # already-quantized children. Doing that here would re-quantize the normals once
 # per zoom level and compound the error all the way down. Instead the reduction
-# runs on the exact float normal field, block by block, and PNG encoding is only
-# ever a terminal write-out - see _generate_block / _reduce_normals_2x.
+# runs on the exact float mean-vector/visibility/leaf-count fields, block by
+# block, and PNG encoding is only ever a terminal write-out - see
+# _generate_block / _reduce_2x. A mean vector is never renormalized to a unit
+# direction until that terminal encode: its magnitude beforehand is exactly the
+# Toksvig roughness factor (how much the leaves underneath it agreed), which
+# would otherwise be silently discarded at every intermediate level.
 
 import concurrent.futures
 import io
@@ -121,6 +126,14 @@ NORMAL_METHOD = "sobel"
 # which is what actually averages the extra source samples away instead of
 # point-sampling past them.
 RESAMPLING = Resampling.bilinear
+
+# Snow-visibility band, in degrees of steepness from vertical. Mirrors fixed
+# WGSL shader constants (SNOW_ANGLE_MIN/MAX/BLEND) - changing these requires a
+# full tileset regeneration, since the value is baked into the A channel of
+# every tile rather than recomputed at draw time.
+SNOW_ANGLE_MIN = 0.0
+SNOW_ANGLE_MAX = 45.0
+SNOW_ANGLE_BLEND = 5.0
 
 # Set to a number to override the source's declared nodata. BEV GeoTIFFs
 # occasionally carry an undeclared sentinel (-9999 and friends) instead of a
@@ -390,10 +403,38 @@ def _normal_by_finite_difference(h: np.ndarray, quad_width: float, quad_height: 
     return np.stack([nx, ny, np.full_like(nx, 2.0)], axis=-1)
 
 
+def _slope_angle_deg(normal: np.ndarray) -> np.ndarray:
+    """(..., 3) ENU normal -> (...) degrees from vertical.
+
+    arctan2(hypot(nx, ny), nz) rather than acos(nz): the numerically stable
+    equivalent (see docs/normal_map_encoding.md's arccos pitfall note - the
+    same conditioning issue applies to a slope angle as to an angle between
+    two normals)."""
+    return np.degrees(np.arctan2(np.hypot(normal[..., 0], normal[..., 1]), normal[..., 2]))
+
+
+def _snow_visibility(normal: np.ndarray) -> np.ndarray:
+    """(..., 3) ENU normal -> (...) float32 in [0, 1].
+
+    Mirrors the weBIGeo shader's calculate_band_falloff: 1.0 for a slope in
+    [SNOW_ANGLE_MIN, SNOW_ANGLE_MAX], linearly ramping to 0 over
+    SNOW_ANGLE_BLEND beyond either edge. The low-edge ramp is dead in practice
+    - a slope angle is never negative, and SNOW_ANGLE_MIN is 0 - but is kept
+    symmetric with the shader's formula rather than special-cased away.
+
+    Linear is an assumption: the shader's calculate_falloff body wasn't
+    available to match exactly. Swap this if it turns out to be smoothstep or
+    similar - it is the only place that would need to change."""
+    steepness = _slope_angle_deg(normal)
+    rise = np.clip((steepness - (SNOW_ANGLE_MIN - SNOW_ANGLE_BLEND)) / SNOW_ANGLE_BLEND, 0.0, 1.0)
+    fall = np.clip((SNOW_ANGLE_MAX + SNOW_ANGLE_BLEND - steepness) / SNOW_ANGLE_BLEND, 0.0, 1.0)
+    return np.minimum(rise, fall).astype(np.float32)
+
+
 def _block_normals(height_apron: np.ndarray, valid: np.ndarray) -> np.ndarray:
     """(APRON_PX, APRON_PX) heights -> (BLOCK_PX, BLOCK_PX, 3) float32 unit ENU
     normals. Invalid pixels come back as the zero vector, which is the invariant
-    _reduce_normals_2x relies on to exclude them from an average."""
+    _reduce_2x relies on to exclude them from an average."""
     # Voids are filled with 0 only so the stencil arithmetic stays finite - every
     # output pixel that touched one is already False in `valid` and is zeroed
     # below, so the fabricated gradient never survives.
@@ -416,39 +457,68 @@ def _block_normals(height_apron: np.ndarray, valid: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------
 # Float-space pyramid
 # --------------------------------------------------------------------------
-def _reduce_normals_2x(normals: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(H,W,3) unit normals + (H,W) validity -> the same at half resolution.
+def _reduce_2x(mean_vec: np.ndarray, snow_vis: np.ndarray, count: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(H,W,3) mean vector (not necessarily unit) + (H,W) snow visibility +
+    (H,W) int64 leaf count -> the same at half resolution.
 
-    Averages the four child vectors and renormalizes. Invalid children are zero
-    vectors (see _block_normals) so they contribute nothing to the sum - a void
-    never drags a real normal toward a fabricated direction - and an output is
-    valid iff at least one of its four inputs was. A fully invalid output stays
-    the zero vector and is turned into the flat normal at encode time.
+    `count` is the exact number of valid MAX_ZOOM leaves under each pixel, not
+    a 0..4 tally of this step's immediate children - and the four children are
+    combined by leaf-count-weighted mean, not by an unweighted average of
+    their own already-averaged values:
 
-    All of this happens on exact float data: unlike cosmos_snow, no parent is
-    ever built by decoding an already-quantized child, so quantization error
-    does not accumulate down the pyramid."""
-    h, w = valid.shape
-    total = normals.reshape(h // 2, 2, w // 2, 2, 3).sum(axis=(1, 3))
-    out_valid = valid.reshape(h // 2, 2, w // 2, 2).any(axis=(1, 3))
-    norm = np.linalg.norm(total, axis=-1, keepdims=True)
-    out = np.divide(total, norm, out=np.zeros_like(total), where=norm > 0)
-    return out.astype(np.float32), out_valid
+        count_out = c0 + c1 + c2 + c3
+        mean_out  = (c0*m0 + c1*m1 + c2*m2 + c3*m3) / count_out
+
+    This is exact by induction (a leaf has count=1|0 and mean=itself; if every
+    child is exact for its own subtree, count_i*mean_i is exactly that
+    subtree's leaf-vector sum). Weighting by an unweighted "how many of the 4
+    children were valid" instead - the natural-looking shortcut - is NOT
+    exact once validity is non-uniform deeper in the tree: it lets a sparsely
+    populated branch outvote a densely populated one at their shared parent.
+    See docs/normal_map_encoding.md for the worked counterexample.
+
+    mean_vec is never renormalized here (unlike the old direction-only
+    reduction) - its magnitude after this call is exactly the Toksvig
+    roughness factor for everything underneath, and renormalizing early would
+    discard it before that magnitude ever reaches the terminal encode step.
+    snow_vis is reduced by the same weighting for consistency, now that the
+    count array exists anyway.
+
+    count can reach 4**(MAX_ZOOM-MIN_ZOOM) - already past uint32 range at
+    MAX_ZOOM=16 (4**16 ~= 4.3e9) - hence int64 in and out. The weighted
+    products are computed in float64: at that magnitude a float32 count can no
+    longer represent the fractional weights it needs to divide by."""
+    h, w = count.shape
+    c4 = count.reshape(h // 2, 2, w // 2, 2).astype(np.float64)
+    total_count = c4.sum(axis=(1, 3)).astype(np.int64)
+
+    mean_sum = (c4[..., None] * mean_vec.reshape(h // 2, 2, w // 2, 2, 3).astype(np.float64)).sum(axis=(1, 3))
+    vis_sum = (c4 * snow_vis.reshape(h // 2, 2, w // 2, 2).astype(np.float64)).sum(axis=(1, 3))
+
+    tc = total_count[..., None].astype(np.float64)
+    mean_out = np.divide(mean_sum, tc, out=np.zeros_like(mean_sum), where=tc > 0).astype(np.float32)
+    vis_out = np.divide(vis_sum, total_count.astype(np.float64), out=np.zeros_like(vis_sum),
+                         where=total_count > 0).astype(np.float32)
+    return mean_out, vis_out, total_count
 
 
 # --------------------------------------------------------------------------
 # PNG encode
 # --------------------------------------------------------------------------
-def _encode_tile(normals: np.ndarray, valid: np.ndarray) -> bytes:
-    """(TILE_SIZE, TILE_SIZE, 3) normals -> RGB PNG bytes. All of the format
-    lives in util/encoding.py; nothing here knows how a normal becomes a byte."""
-    rgb = encoding.encode_normals(normals, valid=valid)
+def _encode_tile(mean_vec: np.ndarray, snow_vis: np.ndarray, valid: np.ndarray) -> bytes:
+    """(TILE_SIZE, TILE_SIZE, 3/1) mean vector + snow visibility -> RGBA PNG
+    bytes. All of the format lives in util/encoding.py; nothing here knows how
+    a normal/roughness/visibility becomes a byte."""
+    rgba = encoding.encode_tile(mean_vec, snow_vis, valid=valid)
     buf = io.BytesIO()
-    Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
+    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
     return buf.getvalue()
 
 
-def _save_tile(conn: tile_db.TileDb, z: int, x: int, y: int, normals: np.ndarray, valid: np.ndarray) -> bool:
+def _save_tile(
+    conn: tile_db.TileDb, z: int, x: int, y: int,
+    mean_vec: np.ndarray, snow_vis: np.ndarray, valid: np.ndarray,
+) -> bool:
     """Worker: encode and store one tile. Returns True if it was written.
 
     Runs on a worker thread - the block arrays are never mutated once the
@@ -459,18 +529,20 @@ def _save_tile(conn: tile_db.TileDb, z: int, x: int, y: int, normals: np.ndarray
         # would be indistinguishable from real flat ground and would bloat the
         # db with the whole non-axis-aligned corner of every 3035 source tile.
         return False
-    conn.save_tile(z, x, y, _encode_tile(normals, valid))
+    conn.save_tile(z, x, y, _encode_tile(mean_vec, snow_vis, valid))
     return True
 
 
 def _save_level(
     conn: tile_db.TileDb, executor: concurrent.futures.Executor, z: int,
-    normals: np.ndarray, valid: np.ndarray, tx0: int, ty0: int,
+    mean_vec: np.ndarray, snow_vis: np.ndarray, count: np.ndarray, tx0: int, ty0: int,
     key: str, total: int, done: int, rate: progress.RateTracker,
 ) -> tuple[int, int]:
-    """Slice one block's float normal field at zoom `z` into TILE_SIZE tiles and
-    write them in parallel. (tx0, ty0) is the tile index of the field's top-left
-    corner at that zoom. Returns the updated (done, written_this_level)."""
+    """Slice one block's float mean-vector/visibility/count fields at zoom `z`
+    into TILE_SIZE tiles and write them in parallel. (tx0, ty0) is the tile
+    index of the field's top-left corner at that zoom. Returns the updated
+    (done, written_this_level)."""
+    valid = count > 0
     per_side = valid.shape[0] // TILE_SIZE
     futures = {}
     for j in range(per_side):
@@ -478,7 +550,8 @@ def _save_level(
             rows = slice(j * TILE_SIZE, (j + 1) * TILE_SIZE)
             cols = slice(i * TILE_SIZE, (i + 1) * TILE_SIZE)
             futures[executor.submit(
-                _save_tile, conn, z, tx0 + i, ty0 + j, normals[rows, cols], valid[rows, cols]
+                _save_tile, conn, z, tx0 + i, ty0 + j,
+                mean_vec[rows, cols], snow_vis[rows, cols], valid[rows, cols],
             )] = (i, j)
 
     written = 0
@@ -495,13 +568,13 @@ def _save_level(
 def _generate_block(
     conn: tile_db.TileDb, executor: concurrent.futures.Executor, src: rasterio.DatasetReader,
     bx: int, by: int, key: str, total: int, done: int, rate: progress.RateTracker,
-) -> tuple[int, int, tuple[np.ndarray, np.ndarray] | None]:
+) -> tuple[int, int, tuple[np.ndarray, np.ndarray, np.ndarray] | None]:
     """Reproject, differentiate and write one block across MAX_ZOOM..BLOCK_ZOOM.
 
     Returns (done, written, block_state), where block_state is the block's
-    BLOCK_ZOOM-level float normals + validity - kept by the caller so the levels
-    above BLOCK_ZOOM can be reduced from exact data too - or None if the block
-    turned out to hold no source data after all."""
+    BLOCK_ZOOM-level (mean_vec, snow_vis, count) - kept by the caller so the
+    levels above BLOCK_ZOOM can be reduced from exact data too - or None if the
+    block turned out to hold no source data after all."""
     heights = _read_block_heights(src, bx, by)
     valid = _stencil_valid(heights)
     if not valid.any():
@@ -513,22 +586,30 @@ def _generate_block(
     normals = _block_normals(heights, valid)
     del heights
 
+    # At MAX_ZOOM every pixel is a single exact leaf: its mean vector is just
+    # itself (count=1, so Toksvig L=1 - no roughness yet), and snow visibility
+    # is computed directly from it, once, before any pyramid reduction.
+    mean_vec = normals
+    snow_vis = _snow_visibility(mean_vec)
+    snow_vis[~valid] = 0.0  # defensive - matches _block_normals zeroing invalid normals
+    count = valid.astype(np.int64)
+
     written = 0
     for z in range(MAX_ZOOM, BLOCK_ZOOM - 1, -1):
         if z != MAX_ZOOM:
-            normals, valid = _reduce_normals_2x(normals, valid)
+            mean_vec, snow_vis, count = _reduce_2x(mean_vec, snow_vis, count)
         per_side = 2 ** (z - BLOCK_ZOOM)
         done, w = _save_level(
-            conn, executor, z, normals, valid, bx * per_side, by * per_side, key, total, done, rate
+            conn, executor, z, mean_vec, snow_vis, count, bx * per_side, by * per_side, key, total, done, rate
         )
         written += w
 
-    return done, written, (normals, valid)
+    return done, written, (mean_vec, snow_vis, count)
 
 
 def _generate_upper_levels(
     conn: tile_db.TileDb, executor: concurrent.futures.Executor,
-    cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]],
+    cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]],
     key: str, total: int, done: int, rate: progress.RateTracker,
 ) -> tuple[int, int]:
     """Build BLOCK_ZOOM-1 .. MIN_ZOOM from the per-block float arrays.
@@ -536,27 +617,31 @@ def _generate_upper_levels(
     Below BLOCK_ZOOM a parent spans four blocks, so this is where the pyramid
     stops being block-local - but it is still the same float reduction, just fed
     from the cached arrays instead of a freshly warped one. A missing quadrant
-    (a block that held no data) stays invalid, so coverage edges degrade to flat
-    rather than to garbage."""
+    (a block that held no data) stays at count=0, so coverage edges degrade to
+    flat rather than to garbage, and never gets to outvote a real quadrant in
+    the leaf-count-weighted average (see _reduce_2x)."""
     half = TILE_SIZE // 2
     written = 0
     for z in range(BLOCK_ZOOM - 1, MIN_ZOOM - 1, -1):
         parents = {(x // 2, y // 2) for x, y in cache}
-        level: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+        level: dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         futures = {}
         for (x, y) in sorted(parents):
-            normals = np.zeros((TILE_SIZE, TILE_SIZE, 3), dtype=np.float32)
-            valid = np.zeros((TILE_SIZE, TILE_SIZE), dtype=bool)
+            mean_vec = np.zeros((TILE_SIZE, TILE_SIZE, 3), dtype=np.float32)
+            snow_vis = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.float32)
+            count = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.int64)
             for dy in (0, 1):
                 for dx in (0, 1):
                     child = cache.get((x * 2 + dx, y * 2 + dy))
                     if child is None:
                         continue
-                    cn, cv = _reduce_normals_2x(*child)
-                    normals[dy * half:(dy + 1) * half, dx * half:(dx + 1) * half] = cn
-                    valid[dy * half:(dy + 1) * half, dx * half:(dx + 1) * half] = cv
-            level[(x, y)] = (normals, valid)
-            futures[executor.submit(_save_tile, conn, z, x, y, normals, valid)] = (x, y)
+                    cm, cv, cc = _reduce_2x(*child)
+                    mean_vec[dy * half:(dy + 1) * half, dx * half:(dx + 1) * half] = cm
+                    snow_vis[dy * half:(dy + 1) * half, dx * half:(dx + 1) * half] = cv
+                    count[dy * half:(dy + 1) * half, dx * half:(dx + 1) * half] = cc
+            level[(x, y)] = (mean_vec, snow_vis, count)
+            valid = count > 0
+            futures[executor.submit(_save_tile, conn, z, x, y, mean_vec, snow_vis, valid)] = (x, y)
 
         for future in concurrent.futures.as_completed(futures):
             written += bool(future.result())
@@ -619,8 +704,9 @@ def _generate(conn: tile_db.TileDb) -> None:
                         cache[(bx, by)] = state
                     conn.commit()
 
-                # ~0.8 MB per block held until the levels below BLOCK_ZOOM are
-                # built - a few hundred MB for a full 50 km source file.
+                # ~1.5 MB per block (256x256 x (3+1 float32 + 1 int64) bytes)
+                # held until the levels below BLOCK_ZOOM are built - a few
+                # hundred MB for a full 50 km source file.
                 logger.info(
                     "als-normals: z%d..z%d done (%d tiles written), reducing %d cached block(s)",
                     BLOCK_ZOOM, MAX_ZOOM, written, len(cache),

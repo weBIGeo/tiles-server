@@ -20,8 +20,8 @@
 # and scripts/normal_map_playground.ipynb so the two can never drift apart.
 #
 # Format: hemi-octahedral projection -> 127-centred 8-bit quantization -> R/G of an
-# RGB PNG (B reserved/zero, no alpha channel). See docs/normal_map_encoding.md for
-# the full reasoning; the short version:
+# RGBA PNG, B = Toksvig roughness factor, A = snow steepness visibility. See
+# docs/normal_map_encoding.md for the full reasoning; the short version:
 #
 #   - Heightfield normals always point up (n.z >= 0), so only a hemisphere needs
 #     encoding. Plain octahedral would confine every value to the |x|+|y| <= 1
@@ -38,6 +38,17 @@
 #   - Quantization is centred on 127 with a half-range of 127 (codes 0..254) rather
 #     than the conventional round((e*0.5+0.5)*255), so that e=0 - a perfectly flat
 #     surface - round-trips exactly instead of coming back tilted by 0.225 degrees.
+#   - B and A are plain 0..255 unorm - unlike R/G they are unsigned [0,1]
+#     quantities with no zero-symmetry to preserve, so there is no reason for the
+#     127-centred trick there.
+#   - Alpha carries real per-pixel data here, which docs/normal_map_encoding.md
+#     generally rejects (browsers premultiply RGB by alpha; libwebp's
+#     lossless=True zeroes RGB behind A=0 unless exact=True is passed). This
+#     format is an explicit, documented exception: the only consumer is a raw
+#     WGSL textureLoad (never filtered/blended sampling), and this tileset is
+#     never re-encoded as WebP or round-tripped through a canvas. See that doc's
+#     "Rejected alternatives" section for the full override reasoning - it does
+#     not silently contradict itself.
 #
 # Frame convention: normals are ENU - +X east, +Y north, +Z up - and metric (the
 # Web Mercator altitude correction is applied before encoding). Nothing here
@@ -51,8 +62,12 @@ QUANT_CENTER = 127
 QUANT_HALF_RANGE = 127
 
 # The value written for pixels with no valid source data - the flat normal
-# (0, 0, 1). Exposed so tile creators don't hardcode the byte triple.
-FLAT_NORMAL_RGB = (QUANT_CENTER, QUANT_CENTER, 0)
+# (0, 0, 1), full Toksvig factor (a flat surface has zero normal variance) and
+# full snow visibility (a flat pixel's own steepness is 0 degrees, which is
+# always inside the visible band). Exposed so tile creators don't hardcode the
+# byte quadruple. Not a special case: these are exactly the values a genuinely
+# flat, valid pixel would compute anyway.
+FLAT_TILE_RGBA = (QUANT_CENTER, QUANT_CENTER, 255, 255)
 
 
 def _sign_not_zero(v: np.ndarray) -> np.ndarray:
@@ -106,27 +121,57 @@ def bytes_to_hemioct(b: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+# Scalar (B/A) channel quantization
+# --------------------------------------------------------------------------
+def scalar_to_byte(x: np.ndarray) -> np.ndarray:
+    """[0, 1] float -> uint8 0..255 unorm. Plain quantization, no 127-centring -
+    unlike the signed hemi-oct components, these are already unsigned [0,1]
+    quantities with no zero-symmetry to preserve."""
+    return np.rint(np.clip(np.asarray(x), 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def byte_to_scalar(b: np.ndarray) -> np.ndarray:
+    """Inverse of scalar_to_byte. uint8 -> float32 in [0, 1]."""
+    return np.asarray(b).astype(np.float32) / 255.0
+
+
+# --------------------------------------------------------------------------
 # Whole-tile convenience round-trip
 # --------------------------------------------------------------------------
-def encode_normals(n: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
-    """(H, W, 3) normals -> (H, W, 3) uint8 RGB, ready for Image.fromarray.
+def encode_tile(mean_normal: np.ndarray, snow_visibility: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
+    """(H, W, 3) possibly non-unit mean normal + (H, W) snow visibility in
+    [0, 1] -> (H, W, 4) uint8 RGBA, ready for Image.fromarray(..., "RGBA").
 
-    R/G carry the quantized hemi-oct pair, B is reserved and written as 0.
-    Where `valid` is False the pixel is replaced by FLAT_NORMAL_RGB, so a
-    nodata void reads as flat ground rather than as whatever the gradient of
-    a zero-filled height array happened to produce."""
-    rg = hemioct_to_bytes(normal_to_hemioct(n))
-    rgb = np.zeros(rg.shape[:-1] + (3,), dtype=np.uint8)
-    rgb[..., :2] = rg
+    `mean_normal` need not be unit length: its magnitude, clipped to [0, 1],
+    IS the Toksvig roughness factor L (1 = the inputs that were averaged into
+    this pixel all agreed, 0 = they cancelled out) - this is the only place a
+    mean vector is normalized to a direction, so magnitude is never discarded
+    before this point. R/G = hemi-oct of the unit direction, B = L,
+    A = snow_visibility. Where `valid` is False the pixel is replaced by
+    FLAT_TILE_RGBA, so a nodata void reads as flat, smooth, fully
+    snow-visible ground rather than as whatever a zero-filled input happened
+    to produce."""
+    mean_normal = np.asarray(mean_normal)
+    length = np.clip(np.linalg.norm(mean_normal, axis=-1), 0.0, 1.0)
+    unit = mean_normal / np.where(length[..., None] > 0.0, length[..., None], 1.0)
+
+    rgba = np.zeros(mean_normal.shape[:-1] + (4,), dtype=np.uint8)
+    rgba[..., :2] = hemioct_to_bytes(normal_to_hemioct(unit))
+    rgba[..., 2] = scalar_to_byte(length)
+    rgba[..., 3] = scalar_to_byte(snow_visibility)
     if valid is not None:
-        rgb[~valid] = FLAT_NORMAL_RGB
-    return rgb
+        rgba[~valid] = FLAT_TILE_RGBA
+    return rgba
 
 
-def decode_normals(rgb: np.ndarray) -> np.ndarray:
-    """Inverse of encode_normals. (H, W, 3 or 4) uint8 -> (H, W, 3) float32
-    normals. The B (and any A) channel is ignored."""
-    return hemioct_to_normal(bytes_to_hemioct(np.asarray(rgb)[..., :2]))
+def decode_tile(rgba: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Inverse of encode_tile. (H, W, 4) uint8 -> (normal (H, W, 3) float32
+    unit vector, roughness_L (H, W) float32, snow_visibility (H, W) float32)."""
+    rgba = np.asarray(rgba)
+    normal = hemioct_to_normal(bytes_to_hemioct(rgba[..., :2]))
+    roughness = byte_to_scalar(rgba[..., 2])
+    snow_visibility = byte_to_scalar(rgba[..., 3])
+    return normal, roughness, snow_visibility
 
 
 # --------------------------------------------------------------------------
