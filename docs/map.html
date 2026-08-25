@@ -104,6 +104,7 @@
     <button id="als-zoom" class="btn btn-sm btn-outline-secondary ms-4" type="button" disabled>ALS normals: zoom to coverage</button>
     <select id="als-channel-select" class="form-select form-select-sm ms-2" style="width:auto" disabled>
       <option value="rgba">ALS normals: RGBA</option>
+      <option value="decoded">ALS normals: Normals Decoded</option>
       <option value="0">ALS normals: R (normal x)</option>
       <option value="1">ALS normals: G (normal y)</option>
       <option value="2">ALS normals: B (roughness)</option>
@@ -429,6 +430,95 @@
     let alsInfo = null;    // status response, needed to rebuild the layer on channel switch
     let alsEntry = null;   // its layerEntries element
 
+    // Un-filters one PNG scanline in place (PNG spec 9.2/9.3). `row` is this
+    // scanline's already-inflated bytes, `prevOut` the previous *decoded*
+    // scanline (all zero for row 0), `bpp` the byte distance back to the
+    // same-channel byte in the same pixel (4 for 8-bit RGBA).
+    function unfilterRow(filterType, row, prevOut, bpp) {
+      for (let i = 0; i < row.length; i++) {
+        const a = i >= bpp ? row[i - bpp] : 0; // reconstructed byte to the left
+        const b = prevOut[i];                  // reconstructed byte above
+        const c = i >= bpp ? prevOut[i - bpp] : 0; // reconstructed byte above-left
+        switch (filterType) {
+          case 0: break; // None
+          case 1: row[i] = (row[i] + a) & 0xff; break; // Sub
+          case 2: row[i] = (row[i] + b) & 0xff; break; // Up
+          case 3: row[i] = (row[i] + ((a + b) >> 1)) & 0xff; break; // Average
+          case 4: { // Paeth
+            const p = a + b - c;
+            const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+            const pred = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+            row[i] = (row[i] + pred) & 0xff;
+            break;
+          }
+          default: throw new Error(`bad PNG filter type ${filterType}`);
+        }
+      }
+      return row;
+    }
+
+    // Decodes a non-interlaced 8-bit RGBA PNG straight to raw pixel bytes,
+    // with no Image/canvas/ImageBitmap step anywhere. Necessary because
+    // *every* such step ends up painting through drawImage() at some point,
+    async function decodePngRGBA(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let offset = 8; // skip the 8-byte PNG signature
+      let width = 0, height = 0, bitDepth = 0, colorType = 0;
+      const idatParts = [];
+      while (offset < bytes.length) {
+        const len = new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0);
+        const type = String.fromCharCode(...bytes.subarray(offset + 4, offset + 8));
+        const data = bytes.subarray(offset + 8, offset + 8 + len);
+        if (type === 'IHDR') {
+          const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+          width = dv.getUint32(0);
+          height = dv.getUint32(4);
+          bitDepth = data[8];
+          colorType = data[9];
+        } else if (type === 'IDAT') {
+          idatParts.push(data);
+        } else if (type === 'IEND') {
+          break;
+        }
+        offset += 12 + len; // length + type + data + crc
+      }
+      if (bitDepth !== 8 || colorType !== 6) {
+        throw new Error(`expected 8-bit RGBA PNG, got bitDepth=${bitDepth} colorType=${colorType}`);
+      }
+
+      const idat = new Uint8Array(idatParts.reduce((n, c) => n + c.length, 0));
+      idatParts.reduce((p, c) => (idat.set(c, p), p + c.length), 0);
+      // PNG's IDAT stream is zlib (RFC 1950), which is what 'deflate' names
+      // in the Streams API - 'deflate-raw' would be the header-less form.
+      const inflated = new Uint8Array(await new Response(
+        new Blob([idat]).stream().pipeThrough(new DecompressionStream('deflate'))
+      ).arrayBuffer());
+
+      const bpp = 4; // 8-bit RGBA
+      const stride = width * bpp;
+      const out = new Uint8ClampedArray(width * height * bpp);
+      let prevOut = new Uint8Array(stride); // row -1 reads as all zero
+      let inPos = 0;
+      for (let y = 0; y < height; y++) {
+        const filterType = inflated[inPos++];
+        const row = inflated.subarray(inPos, inPos + stride);
+        inPos += stride;
+        const outRow = out.subarray(y * stride, (y + 1) * stride);
+        outRow.set(unfilterRow(filterType, row, prevOut, bpp));
+        prevOut = outRow;
+      }
+      return new ImageData(out, width, height);
+    }
+
+    // Fetches a tile and returns its exact, unpremultiplied pixel bytes -
+    // see decodePngRGBA for why a manual decode is necessary here.
+    async function fetchTilePixels(coords) {
+      const url = L.Util.template('./v1/als-normals/{z}/{x}/{y}.png', coords);
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      return decodePngRGBA(await res.arrayBuffer());
+    }
+
     // Renders one raw RGBA channel of the encoded tile as grayscale, so R/G
     // (hemi-oct normal xy), B (Toksvig roughness) and A (snow steepness
     // visibility) can each be sanity-checked against util/encoding.py's
@@ -439,23 +529,52 @@
         const size = this.getTileSize();
         tile.width = size.x;
         tile.height = size.y;
-        const ctx = tile.getContext('2d');
         const channel = this.options.channel; // 0=R 1=G 2=B 3=A
-        const img = new Image();
-        img.onload = () => {
-          ctx.drawImage(img, 0, 0, size.x, size.y);
-          const data = ctx.getImageData(0, 0, size.x, size.y);
-          const px = data.data;
-          for (let i = 0; i < px.length; i += 4) {
-            const v = px[i + channel];
-            px[i] = px[i + 1] = px[i + 2] = v;
-            px[i + 3] = 255;
-          }
-          ctx.putImageData(data, 0, 0);
-          done(null, tile);
-        };
-        img.onerror = () => done(null, tile); // missing tile -> blank
-        img.src = L.Util.template('./v1/als-normals/{z}/{x}/{y}.png', coords);
+        fetchTilePixels(coords)
+          .then(data => {
+            if (data) {
+              const px = data.data;
+              for (let i = 0; i < px.length; i += 4) {
+                const v = px[i + channel];
+                px[i] = px[i + 1] = px[i + 2] = v;
+                px[i + 3] = 255;
+              }
+              tile.getContext('2d').putImageData(data, 0, 0);
+            }
+            done(null, tile);
+          })
+          .catch(() => done(null, tile)); // missing tile -> blank
+        return tile;
+      },
+    });
+
+    const NormalDecodedLayer = L.GridLayer.extend({
+      createTile: function (coords, done) {
+        const tile = document.createElement('canvas');
+        const size = this.getTileSize();
+        tile.width = size.x;
+        tile.height = size.y;
+        fetchTilePixels(coords)
+          .then(data => {
+            if (data) {
+              const px = data.data;
+              for (let i = 0; i < px.length; i += 4) {
+                const ex = (px[i] - 127) / 127;
+                const ey = (px[i + 1] - 127) / 127;
+                const tx = (ex + ey) * 0.5;
+                const ty = (ex - ey) * 0.5;
+                const tz = 1 - Math.abs(tx) - Math.abs(ty);
+                const len = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+                px[i] = Math.round((tx / len * 0.5 + 0.5) * 255);
+                px[i + 1] = Math.round((ty / len * 0.5 + 0.5) * 255);
+                px[i + 2] = Math.round((tz / len * 0.5 + 0.5) * 255);
+                px[i + 3] = 255;
+              }
+              tile.getContext('2d').putImageData(data, 0, 0);
+            }
+            done(null, tile);
+          })
+          .catch(() => done(null, tile)); // missing tile -> blank
         return tile;
       },
     });
@@ -469,9 +588,9 @@
         maxNativeZoom: alsInfo.max_zoom,
         attribution: 'Normals derived from <a href="https://www.bev.gv.at/">BEV</a> ALS',
       };
-      return channel === 'rgba'
-        ? L.tileLayer('./v1/als-normals/{z}/{x}/{y}.png', opts)
-        : new ChannelLayer({ ...opts, channel: Number(channel) });
+      if (channel === 'rgba') return L.tileLayer('./v1/als-normals/{z}/{x}/{y}.png', opts);
+      if (channel === 'decoded') return new NormalDecodedLayer(opts);
+      return new ChannelLayer({ ...opts, channel: Number(channel) });
     }
 
     async function loadAlsNormals() {
