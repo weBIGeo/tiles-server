@@ -2,6 +2,8 @@
 requests>=2.31
 boto3>=1.34        # only for the S3 raw-GeoTIFF download
 rasterio>=1.4      # CRS stamping in fetch_bev_als.py
+# validate_sun_exposure.py imports tile_creators/sun_exposure.py, so it needs
+# the server's requirements.txt (numba, numpy, rasterio, Pillow) instead.
 # Optional: GDAL python bindings, only needed for `tif --crop-austria`.
 # Install via your platform package manager / conda; pip install gdal is fiddly.
 # gdal

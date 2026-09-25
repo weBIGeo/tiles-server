@@ -58,7 +58,8 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
   `PRAGMA synchronous=NORMAL`, and creates the standard `tiles(z, x, y, data)` table —
   so a tile source never touches `sqlite3` directly, it just calls `get_tile`/
   `save_tile`/`tile_exists`/`commit`. Used by `tile_creators/als_normals.py`,
-  `tile_creators/cosmos_snow.py` and `tile_creators/debug_ortho.py`.
+  `tile_creators/cosmos_snow.py`, `tile_creators/debug_ortho.py` and
+  `tile_creators/sun_exposure.py`.
 - **log_config.py** — custom colored logging formatter matching the style used across
   weBIGeo projects (see the C++ formatter it mirrors, linked in the module). Sets up
   console + rotating file handlers and per-logger level overrides from
@@ -105,6 +106,19 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
     until ready). This module is a reference implementation for how a "tile source"
     fits together (bbox → tile range → fetch/generate → SQLite cache → serve), useful
     as a pattern when wiring up real data sources (e.g. exolabs/COSMOS).
+  - **tile_creators/sun_exposure.py** — monthly direct-sun tiles (two tilesets per
+    month: `hours` h/day and clear-sky `energy` Wh/m²/day, RGB PNG with R = mean,
+    G = std) from the same kind of ALS raster, including shadows from terrain,
+    buildings and trees. Convex-hull horizon sweep in ~530 azimuths 0.5° apart
+    (numba kernel `_sweep_direction`), over nested 1 m / 8 m / 32 m (max-pooled)
+    geometry, combined with per-month sun-path lookup tables, so all requested
+    months share one sweep. Generated **on demand** (`POST
+    /v1/sun-exposure/generate?months=06[,12]`), one run at a time, and for now only
+    for one `COMPUTE_AREA_M` square (default 2 km at the source centre) — full-source
+    mode is a documented extension, not implemented. Months are keyed `01`..`12`;
+    `<MM>_meta.json` (written last) marks a month as generated. Method, encoding,
+    limitations: `docs/sun_exposure.md`; synthetic checks:
+    `scripts/validate_sun_exposure.py`.
   - **tile_creators/progress.py** — `RateTracker`, the shared windowed "tiles/s"
     throughput helper the generation loops feed into their `processes.py` messages,
     so they all report rate the same way. Windowed rather than cumulative because
@@ -115,6 +129,9 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
     version string from the badge in `README.md` (the version is intentionally *not*
     duplicated in code — bump it only in the README badge). Note it resolves the README
     one directory up, since this module lives in `util/`.
+  - **util/sun.py** — vectorized sun position (port of weBIGeo's
+    `nucleus/utils/sun_calculations.cpp`/suncalc; compass azimuth, apparent altitude)
+    and r.sun's clear-sky beam irradiance. Used by `tile_creators/sun_exposure.py`.
   - **util/encoding.py** — normal-vector encode/decode shared by
     `tile_creators/als_normals.py` and the playground notebook: hemi-octahedral
     projection plus the 127-centred 8-bit quantization written into the R/G channels of
@@ -129,13 +146,18 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
     for future integration.
   - **scripts/fetch_bev_als.py** — CLI for downloading BEV ALS DTM/DSM GeoTIFF tiles
     (1 m/px, EPSG:3035, 50×50 km per tile) and stamping the CRS the downloads omit.
+  - **scripts/validate_sun_exposure.py** — synthetic checks for
+    `tile_creators/sun_exposure.py` (sun position vs suncalc, hull sweep and monthly
+    tables vs brute-force ray marching, tile pipeline). No data or server needed;
+    takes several minutes because the references are deliberately naive.
   - **scripts/normal_map_playground.ipynb** — exploratory notebook for terrain normals:
     reprojects DTM/DSM into a single slippy tile, compares gradient methods, and
     measures the encoding in `util/encoding.py`.
 - **docs/index.html** — the landing page served at `/`.
 - **docs/map.html** — Leaflet map served at `/map`, with a drag-reorderable overlay
-  stack: the `debug_ortho` tileset, the date-selectable COSMOS snow layer, and the ALS
-  normals. Every layer renders its tiles as-is, with no client-side decoding — the
+  stack: the `debug_ortho` tileset, the date-selectable COSMOS snow layer, the ALS
+  normals, and the month-selectable sun exposure layers. Every layer renders its tiles
+  as-is, with no client-side decoding — the
   point of the page is to see what the server actually stored. Generation triggers and
   progress live on `docs/index.html`, not here.
 - **docs/cosmos-api.md** — research notes on the exolabs/COSMOS snow data API,

@@ -314,6 +314,71 @@
       </div>
     </div>
 
+
+    <div class="card mb-3 mt-4">
+      <div class="card-header">Sun exposure — generate months</div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Monthly direct-sun tiles (hours/day and clear-sky Wh/m²/day),
+          including shadows from terrain, buildings and trees, computed from the ALS raster
+          <code>TILE_SOURCE</code> in <code>tile_creators/sun_exposure.py</code> points at — for now only a
+          <code>COMPUTE_AREA_M</code> square (default 2 km, centre of the source). Generated on demand; all months
+          requested together share one horizon sweep, so asking for several at once costs little more than one.
+          Progress shows up in Background processes above. Method and encoding: <code>docs/sun_exposure.md</code>.</p>
+        <form id="sun-generate-form" class="d-flex gap-2 align-items-center flex-wrap">
+          <input type="text" class="form-control" id="sun-months-input" style="max-width:200px"
+            placeholder="06 or 06,12" pattern="^(0[1-9]|1[0-2])(,(0[1-9]|1[0-2]))*$" required>
+          <button type="submit" class="btn btn-primary btn-sm">Generate</button>
+        </form>
+        <div id="sun-generate-result" class="small text-secondary mt-2"></div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-warning" style="font-size:.7rem;letter-spacing:.05em">POST</span>
+        <code>/v1/sun-exposure/generate?months=06[,12,...]</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Starts one background run for every listed month (<code>01</code>–<code>12</code>)
+          that isn't ready yet. Only one run at a time: while one is running, a request just reports statuses
+          (<code>busy</code> for months not part of it). <code>400</code> for a malformed month.</p>
+        <pre class="border rounded p-3 small mb-0"><code>{ "months": { "06": "generating", "12": "ready" } }</code></pre>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/sun-exposure/months</code> · <code>/v1/sun-exposure/&lt;MM&gt;/status</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">Every month that is generated or generating, and one month's status
+          plus its meta once generated: the computed area's WGS84 <code>bounds</code> (tiles exist only there),
+          zoom range, the value scales used by the encoding, and mean/max statistics.</p>
+        <pre class="border rounded p-3 small mb-0"><code>{
+  "status": "ready",
+  "meta": { "bounds": [13.1, 47.2, 13.13, 47.22], "min_zoom": 0, "max_zoom": 16,
+            "hours_max": 16.0, "energy_max": 12000.0, ... }
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span class="badge text-bg-success" style="font-size:.7rem;letter-spacing:.05em">GET</span>
+        <code>/v1/sun-exposure/&lt;MM&gt;/&lt;hours|energy&gt;/&lt;z&gt;/&lt;x&gt;/&lt;y&gt;.png</code>
+      </div>
+      <div class="card-body">
+        <p class="text-secondary small mb-2">RGB PNG, <code>R = round(mean * 254 / MAX)</code>,
+          <code>G = round(std * 255 / (MAX / 2))</code>, B unused (0), <code>R = 255</code> = nodata.
+          <code>MAX</code> is <code>hours_max</code> (h/day) or <code>energy_max</code> (Wh/m²/day) from the
+          status meta. The std is over everything a pixel covers, so it grows at lower zoom levels. Returns
+          <code>image/png</code>, <code>503</code> while the month is still generating, <code>404</code> outside
+          the computed area.</p>
+        <a href="./map" class="btn btn-sm btn-outline-primary">🗺️ View these tiles on a map &rarr;</a>
+      </div>
+    </div>
+
   </div>
 
   <script>
@@ -424,6 +489,23 @@
       }
       setTimeout(pollAls, 3000);
     }
+
+    // === SUN EXPOSURE — GENERATE MONTHS ===
+    document.getElementById('sun-generate-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const months = document.getElementById('sun-months-input').value.trim();
+      const resultEl = document.getElementById('sun-generate-result');
+      resultEl.textContent = 'Starting…';
+      try {
+        const r = await fetch(`./v1/sun-exposure/generate?months=${encodeURIComponent(months)}`, { method: 'POST' });
+        const data = await r.json();
+        resultEl.textContent = r.ok
+          ? Object.entries(data.months).map(([m, st]) => `${m}: ${st}`).join(' · ')
+          : `Error: ${data.error}`;
+      } catch {
+        resultEl.textContent = 'Could not reach the server.';
+      }
+    });
 
     pollAls();
   </script>

@@ -110,6 +110,9 @@
       <option value="2">ALS normals: B (roughness)</option>
       <option value="3">ALS normals: A (snow steepness)</option>
     </select>
+    <span class="text-secondary small ms-4 me-2">Sun month:</span>
+    <select id="sun-month-select" class="form-select form-select-sm" style="width:auto" disabled></select>
+    <button id="sun-zoom" class="btn btn-sm btn-outline-secondary ms-2" type="button" disabled>Sun exposure: zoom to area</button>
   </nav>
 
   <div id="map"></div>
@@ -655,6 +658,87 @@
     });
 
     loadAlsNormals();
+
+    // === SUN EXPOSURE: month-selectable hours + energy layers ===
+    // Two layers (one per tileset), rendered as-is like every other layer: R =
+    // mean, G = std, so a raw tile reads red where it's sunny and greenish
+    // where the pixel hides a lot of variation. Only a small computed area
+    // has tiles (see sun_exposure.COMPUTE_AREA_M), hence the zoom button.
+    const sunMonthSelect = document.getElementById('sun-month-select');
+    const sunZoomBtn = document.getElementById('sun-zoom');
+    const sunEntries = {}; // product -> layerEntries element
+    let sunMeta = null;    // meta of the selected month
+
+    function createSunLayer(month, product, meta) {
+      return L.tileLayer(`./v1/sun-exposure/${month}/${product}/{z}/{x}/{y}.png`, {
+        tileSize: 256,
+        minZoom: 0,
+        maxZoom: 21,
+        minNativeZoom: meta ? meta.min_zoom : 0,
+        maxNativeZoom: meta ? meta.max_zoom : 16,
+        attribution: 'Sun exposure derived from <a href="https://www.bev.gv.at/">BEV</a> ALS',
+      });
+    }
+
+    async function selectSunMonth(month) {
+      try {
+        const info = await fetch(`./v1/sun-exposure/${month}/status`).then(r => r.json());
+        sunMeta = info.meta;
+      } catch {
+        sunMeta = null;
+      }
+      for (const product of ['hours', 'energy']) {
+        const name = `Sun exposure ${product} (${month})`;
+        const layer = createSunLayer(month, product, sunMeta);
+        let entry = sunEntries[product];
+        if (entry) {
+          if (map.hasLayer(entry.layer)) map.removeLayer(entry.layer);
+          entry.layer = layer;
+          entry.name = name;
+          if (entry.active) map.addLayer(layer);
+        } else {
+          // Inactive at first: the area is a small patch somewhere in the
+          // source raster; the zoom button turns the hours layer on.
+          entry = { name, layer, active: false };
+          sunEntries[product] = entry;
+          layerEntries.unshift(entry);
+        }
+      }
+      sunZoomBtn.disabled = !(sunMeta && sunMeta.bounds);
+      applyLayerOrder();
+      layerOrderControl._renderList();
+    }
+
+    async function loadSunMonths() {
+      let months;
+      try {
+        months = await fetch('./v1/sun-exposure/months').then(r => r.json());
+      } catch {
+        return;
+      }
+      const ready = months.filter(m => m.status === 'ready').map(m => m.month);
+      if (!ready.length) return; // generate one from the landing page first
+      sunMonthSelect.innerHTML = ready.map(m => `<option value="${m}">${m}</option>`).join('');
+      sunMonthSelect.disabled = false;
+      selectSunMonth(ready[ready.length - 1]);
+    }
+
+    sunMonthSelect.addEventListener('change', () => selectSunMonth(sunMonthSelect.value));
+
+    sunZoomBtn.addEventListener('click', () => {
+      if (!sunMeta || !sunMeta.bounds) return;
+      const [w, s, e, n] = sunMeta.bounds;
+      map.fitBounds([[s, w], [n, e]]);
+      const entry = sunEntries.hours;
+      if (entry && !entry.active) {
+        entry.active = true;
+        map.addLayer(entry.layer);
+        applyLayerOrder();
+        layerOrderControl._renderList();
+      }
+    });
+
+    loadSunMonths();
   </script>
 </body>
 

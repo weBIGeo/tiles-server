@@ -35,13 +35,16 @@ class RateTracker:
     one per generation run and call sample(done) with the same cumulative
     count passed to processes.update()."""
 
-    def __init__(self, window_seconds: float = DEFAULT_WINDOW_SECONDS):
+    def __init__(self, window_seconds: float = DEFAULT_WINDOW_SECONDS, unit: str = "tiles"):
         self._window_seconds = window_seconds
+        # What `done` counts - only used in the formatted rate. sun_exposure.py
+        # reports sweep directions rather than tiles for most of its run.
+        self._unit = unit
         self._samples: deque[tuple[float, int]] = deque()
 
     def sample(self, done: int) -> str:
         """Record `done` (cumulative count) now, and return the current rate
-        formatted as e.g. "8.3 tiles/s"."""
+        formatted as e.g. "8.3 tiles/s" (or whatever unit was given)."""
         now = time.monotonic()
         self._samples.append((now, done))
         cutoff = now - self._window_seconds
@@ -51,4 +54,4 @@ class RateTracker:
         t0, d0 = self._samples[0]
         dt = now - t0
         rate = (done - d0) / dt if dt > 0 else 0.0
-        return f"{rate:.1f} tiles/s"
+        return f"{rate:.1f} {self._unit}/s"

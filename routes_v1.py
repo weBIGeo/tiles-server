@@ -18,8 +18,8 @@
 
 import processes
 from util import general
-from tile_creators import als_normals, cosmos_snow, debug_ortho
-from flask import Blueprint, Response, abort, jsonify
+from tile_creators import als_normals, cosmos_snow, debug_ortho, sun_exposure
+from flask import Blueprint, Response, abort, jsonify, request
 
 bp = Blueprint("v1", __name__, url_prefix="/v1")
 
@@ -129,3 +129,51 @@ def als_normals_tile(z: int, x: int, y: int):
 
 bp.add_url_rule("/als-normals/status", view_func=als_normals_status)
 bp.add_url_rule("/als-normals/<int:z>/<int:x>/<int:y>.png", view_func=als_normals_tile)
+
+
+def sun_exposure_months():
+    return jsonify(sun_exposure.list_months())
+
+
+def sun_exposure_generate():
+    """POST ?months=06[,07,...] - one background run for all listed months,
+    since they share the expensive horizon sweep."""
+    raw = request.args.get("months", "")
+    months = [m.strip() for m in raw.split(",") if m.strip()]
+    if not months:
+        return jsonify({"error": "missing ?months=MM[,MM...]"}), 400
+    try:
+        statuses = sun_exposure.start_generation(months)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"months": statuses})
+
+
+def sun_exposure_status(month: str):
+    """Status plus the month's meta once generated: the computed area's WGS84
+    bounds (the tiles only cover that patch), zoom range and value scales."""
+    try:
+        sun_exposure.validate_month(month)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"status": sun_exposure.get_status(month), "meta": sun_exposure.get_meta(month)})
+
+
+def sun_exposure_tile(month: str, product: str, z: int, x: int, y: int):
+    if product not in sun_exposure.PRODUCTS:
+        abort(404)
+    conn = sun_exposure.get_db(month, product)
+    data = conn.get_tile(z, x, y) if conn is not None else None
+    if data is not None:
+        return Response(data, mimetype="image/png")
+    if not sun_exposure.is_ready(month):
+        return jsonify({"error": "this sun exposure month has not been generated yet"}), 503
+    # Ready but no tile: outside the computed area, which is the normal case
+    # for everything but a small patch.
+    abort(404)
+
+
+bp.add_url_rule("/sun-exposure/months", view_func=sun_exposure_months)
+bp.add_url_rule("/sun-exposure/generate", view_func=sun_exposure_generate, methods=["POST"])
+bp.add_url_rule("/sun-exposure/<month>/status", view_func=sun_exposure_status)
+bp.add_url_rule("/sun-exposure/<month>/<product>/<int:z>/<int:x>/<int:y>.png", view_func=sun_exposure_tile)

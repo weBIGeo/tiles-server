@@ -51,6 +51,7 @@ log_level_overrides = {
     "boto3":      "WARNING",
     "botocore":   "WARNING",
     "s3transfer": "WARNING",  # logs a line per multipart-download chunk at DEBUG
+    "numba":      "WARNING",  # JIT compilation dumps bytecode/SSA/IR dumps at DEBUG
 }
 
 # Email notifications. Leave smtp_host or notify_email empty/None to disable.

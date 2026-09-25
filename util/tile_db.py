@@ -99,3 +99,12 @@ class TileDb:
         with self._lock:
             self._conn.commit()
             self._since_commit = 0
+
+    def close(self) -> None:
+        """Commit and close the connection. Needed before deleting the db file
+        on Windows, which refuses to remove a file that is still open (see
+        tile_creators/sun_exposure.py's _replace_db). The instance is unusable
+        afterwards."""
+        with self._lock:
+            self._conn.commit()
+            self._conn.close()

@@ -89,7 +89,7 @@ PROCESS_LABEL = "ALS normals ({name})"
 # mean on it. Left at 17 here because that is the configuration the notebook
 # actually validated; flipping it is this one line, but flip RESAMPLING with it
 # (see below) since z16 turns the reprojection into a downsample.
-MAX_ZOOM = 16 #17
+MAX_ZOOM = 17 #17
 MIN_ZOOM = 0
 
 TILE_SIZE = 256
