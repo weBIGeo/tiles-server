@@ -89,6 +89,21 @@
       flex-grow: 1;
       cursor: pointer;
     }
+
+    .picker-result {
+      position: absolute;
+      left: 10px;
+      bottom: 20px;
+      z-index: 1000;
+      background: var(--bs-body-bg, #fff);
+      color: var(--bs-body-color, #212529);
+      border-radius: .5rem;
+      box-shadow: 0 1px 5px rgba(0, 0, 0, .4);
+      padding: .4rem .6rem;
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+    }
   </style>
 </head>
 
@@ -113,11 +128,17 @@
     <span class="text-secondary small ms-4 me-2">Sun month:</span>
     <select id="sun-month-select" class="form-select form-select-sm" style="width:auto" disabled></select>
     <button id="sun-zoom" class="btn btn-sm btn-outline-secondary ms-2" type="button" disabled>Sun exposure: zoom to area</button>
+    <button id="picker-toggle" class="btn btn-sm btn-outline-secondary ms-4" type="button"
+      title="Click the map to read off a COMPUTE_AREA_CENTER literal">📍 Pick center</button>
   </nav>
 
   <div id="map"></div>
   <div class="alert alert-warning shadow status-banner d-none" id="status-banner" role="alert"></div>
   <div class="alert alert-warning shadow status-banner d-none" id="status-banner-snow" style="top:108px" role="alert"></div>
+  <div class="picker-result d-none" id="picker-result">
+    <code id="picker-result-text"></code>
+    <button class="btn btn-sm btn-outline-secondary" id="picker-copy" type="button">Copy</button>
+  </div>
 
   <script>
     // Stephansplatz, matches debug_ortho.STEPHANSPLATZ_LAT/LON.
@@ -739,6 +760,41 @@
     });
 
     loadSunMonths();
+
+    // === LOCATION PICKER ===
+    // sun_exposure.COMPUTE_AREA_CENTER is a module constant (tile_creators/
+    // sun_exposure.py), not an API parameter - this doesn't call the server,
+    // it just formats a click as the exact (lon, lat) WGS84 tuple literal
+    // that constant expects, ready to paste in.
+    const pickerToggle = document.getElementById('picker-toggle');
+    const pickerResult = document.getElementById('picker-result');
+    const pickerResultText = document.getElementById('picker-result-text');
+    const pickerCopyBtn = document.getElementById('picker-copy');
+    let pickerActive = false;
+    let pickerMarker = null;
+
+    pickerToggle.addEventListener('click', () => {
+      pickerActive = !pickerActive;
+      pickerToggle.classList.toggle('btn-secondary', pickerActive);
+      pickerToggle.classList.toggle('btn-outline-secondary', !pickerActive);
+      map.getContainer().style.cursor = pickerActive ? 'crosshair' : '';
+    });
+
+    map.on('click', (e) => {
+      if (!pickerActive) return;
+      const { lat, lng } = e.latlng;
+      if (pickerMarker) {
+        pickerMarker.setLatLng(e.latlng);
+      } else {
+        pickerMarker = L.marker(e.latlng).addTo(map);
+      }
+      pickerResultText.textContent = `COMPUTE_AREA_CENTER = (${lng.toFixed(6)}, ${lat.toFixed(6)})`;
+      pickerResult.classList.remove('d-none');
+    });
+
+    pickerCopyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(pickerResultText.textContent).catch(() => { });
+    });
   </script>
 </body>
 

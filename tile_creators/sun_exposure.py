@@ -115,7 +115,8 @@ COMPUTE_AREA_M = 5000
 # TILE_SOURCE. The centre is also the best place for a test: a central area
 # sees ~24 km of real surroundings in every direction, while an area near the
 # source edge gets too much sun from the side where terrain is missing.
-COMPUTE_AREA_CENTER = None
+#COMPUTE_AREA_CENTER = None
+COMPUTE_AREA_CENTER = (12.625394, 47.172218)
 
 # --------------------------------------------------------------------------
 # Nested occluder geometry
