@@ -107,8 +107,9 @@ shares) are fine; starting the process, hitting its endpoints, or killing it are
     fits together (bbox → tile range → fetch/generate → SQLite cache → serve), useful
     as a pattern when wiring up real data sources (e.g. exolabs/COSMOS).
   - **tile_creators/sun_exposure.py** — monthly direct-sun tiles (two tilesets per
-    month: `hours` h/day and clear-sky `energy` Wh/m²/day, RGB PNG with R = mean,
-    G = std) from the same kind of ALS raster, including shadows from terrain,
+    month: `hours` h/day and clear-sky `energy` Wh/m²/day, RGB PNG with mean +
+    std at fixed per-product scales so clients need no meta — hours: 8-bit R = mean,
+    G = std, cap 16 h; energy: 16-bit mean in R/G (hi/lo), B = std, cap 9000 Wh) from the same kind of ALS raster, including shadows from terrain,
     buildings and trees. Convex-hull horizon sweep in ~530 azimuths 0.5° apart
     (numba kernel `_sweep_direction`), over nested 1 m / 8 m / 32 m (max-pooled)
     geometry, combined with per-month sun-path lookup tables, so all requested

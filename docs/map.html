@@ -681,9 +681,10 @@
     loadAlsNormals();
 
     // === SUN EXPOSURE: month-selectable hours + energy layers ===
-    // Two layers (one per tileset), rendered as-is like every other layer: R =
-    // mean, G = std, so a raw tile reads red where it's sunny and greenish
-    // where the pixel hides a lot of variation. Only a small computed area
+    // Two layers (one per tileset), rendered as-is like every other layer.
+    // hours: R = mean, G = std, so a raw tile reads red where it's sunny and
+    // greenish where the pixel hides a lot of variation. energy: R/G = 16-bit
+    // mean (high/low byte), B = std, so its raw G channel looks like noise. Only a small computed area
     // has tiles (see sun_exposure.COMPUTE_AREA_M), hence the zoom button.
     const sunMonthSelect = document.getElementById('sun-month-select');
     const sunZoomBtn = document.getElementById('sun-zoom');

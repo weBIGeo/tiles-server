@@ -358,7 +358,7 @@
         <pre class="border rounded p-3 small mb-0"><code>{
   "status": "ready",
   "meta": { "bounds": [13.1, 47.2, 13.13, 47.22], "min_zoom": 0, "max_zoom": 16,
-            "hours_max": 16.0, "energy_max": 12000.0, ... }
+            "hours_max": 16.0, "energy_max": 9000.0, ... }
 }</code></pre>
       </div>
     </div>
@@ -369,10 +369,12 @@
         <code>/v1/sun-exposure/&lt;MM&gt;/&lt;hours|energy&gt;/&lt;z&gt;/&lt;x&gt;/&lt;y&gt;.png</code>
       </div>
       <div class="card-body">
-        <p class="text-secondary small mb-2">RGB PNG, <code>R = round(mean * 254 / MAX)</code>,
+        <p class="text-secondary small mb-2">RGB PNG with fixed scales (no meta needed to decode).
+          <b>hours</b> (h/day, <code>MAX = 16</code>): <code>R = round(mean * 254 / MAX)</code>,
           <code>G = round(std * 255 / (MAX / 2))</code>, B unused (0), <code>R = 255</code> = nodata.
-          <code>MAX</code> is <code>hours_max</code> (h/day) or <code>energy_max</code> (Wh/m²/day) from the
-          status meta. The std is over everything a pixel covers, so it grows at lower zoom levels. Returns
+          <b>energy</b> (Wh/m²/day, <code>MAX = 9000</code>): 16-bit mean
+          <code>v = R * 256 + G = round(mean * 65534 / MAX)</code>, <code>v = 65535</code> = nodata,
+          <code>B = round(std * 255 / (MAX / 2))</code>. The std is over everything a pixel covers, so it grows at lower zoom levels. Returns
           <code>image/png</code>, <code>503</code> while the month is still generating, <code>404</code> outside
           the computed area.</p>
         <a href="./map" class="btn btn-sm btn-outline-primary">🗺️ View these tiles on a map &rarr;</a>

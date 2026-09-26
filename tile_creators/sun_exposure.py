@@ -45,7 +45,8 @@
 #    geometry, so all requested months share one set of sweeps.
 # 4. The 3035 result is averaged onto the Web Mercator tile grid and reduced
 #    into a mean/std pyramid (exact, leaf-count weighted, same pattern as
-#    als_normals.py), and written as RGB PNGs: R = mean, G = std.
+#    als_normals.py), and written as RGB PNGs: mean + std, with a fixed
+#    per-product scale (see "Encoding" below) so a client never needs the meta.
 #
 # The first milestone computes one COMPUTE_AREA_M square (by default at the
 # centre of TILE_SOURCE), not the whole 50 km source - see the "full-source
@@ -202,11 +203,28 @@ MAX_ZOOM = 17
 MIN_ZOOM = 0
 TILE_SIZE = 256
 
-# Encoding (see docs/sun_exposure.md): R = round(mean * 254 / MAX),
-# 0..254; G = round(std * 255 / (MAX / 2)); B = 0; R = 255 marks nodata.
-HOURS_MAX = 16.0  # h/day - longest possible day at Austrian latitudes ~15.9 h
-ENERGY_MAX = 12000.0  # Wh/m^2/day - above a clear-sky June day on a sun-facing slope
+# Encoding (see docs/sun_exposure.md). The scales are fixed parts of the tile
+# format, not per-dataset values - a renderer hardcodes them (the meta still
+# echoes them for information). Changing one invalidates every stored tile.
+#
+# hours:  R = round(mean * 254 / HOURS_MAX), 0..254, R = 255 marks nodata;
+#         G = round(std * 255 / (HOURS_MAX / 2)); B = 0.
+# energy: mean as 16 bit big-endian, R = high byte, G = low byte:
+#         v = round(mean * 65534 / ENERGY_MAX), 0..65534, 0xFFFF marks nodata;
+#         B = round(std * 255 / (ENERGY_MAX / 2)).
+# Energy gets 16 bit because it spans ~50x between a shaded north slope in
+# winter and a sunny summer one - 8 bit would band badly at the low end. Split
+# bytes mean a renderer must fetch texels unfiltered and interpolate after
+# decoding.
+HOURS_MAX = 16.0  # h/day - longest possible day at Austrian latitudes ~16.0 h (49 N)
+# Wh/m^2/day. The most any fixed surface in Austria can receive under this
+# module's clear-sky model is ~8350 (June, 49 N, 4000 m, best-oriented slope -
+# not a flat surface: in winter a steep south slope gets ~3.5x flat, only in
+# June are the two about equal). ~8% headroom on top for LINKE_TURBIDITY
+# tweaks, since this is a fixed format constant.
+ENERGY_MAX = 9000.0
 NODATA_CODE = 255
+NODATA_CODE_16 = 0xFFFF
 
 COMMIT_BATCH_SIZE = 500
 
@@ -1023,25 +1041,36 @@ def _reduce_level(count, s1, s2, tx0, ty0):
     return out[0], out[1], out[2], tx0 // 2, ty0 // 2
 
 
-def _encode_tile(count: np.ndarray, s1: np.ndarray, s2: np.ndarray, scale: float) -> bytes:
-    """One tile's sums -> RGB PNG: R = mean, G = std (population std over the
-    tile pixel's leaves, including the sub-pixel variance at max zoom), B = 0.
+def _encode_tile(count: np.ndarray, s1: np.ndarray, s2: np.ndarray, product: str) -> bytes:
+    """One tile's sums -> RGB PNG in `product`'s encoding (see the Encoding
+    comment at the top): mean and std, where std is the population std over
+    the tile pixel's leaves, including the sub-pixel variance at max zoom.
     See docs/sun_exposure.md for why RGB rather than a 2-channel PNG."""
     valid = count > 0
     n = np.maximum(count, 1.0)
     mean = s1 / n
     std = np.sqrt(np.maximum(s2 / n - mean * mean, 0.0))
     rgb = np.zeros(count.shape + (3,), dtype=np.uint8)
-    rgb[..., 0] = np.clip(np.rint(mean * (254.0 / scale)), 0, 254).astype(np.uint8)
-    rgb[..., 1] = np.clip(np.rint(std * (255.0 / (scale / 2.0))), 0, 255).astype(np.uint8)
-    rgb[~valid, 0] = NODATA_CODE
-    rgb[~valid, 1] = 0
+    if product == "hours":
+        rgb[..., 0] = np.clip(np.rint(mean * (254.0 / HOURS_MAX)), 0, 254).astype(np.uint8)
+        rgb[..., 1] = np.clip(np.rint(std * (255.0 / (HOURS_MAX / 2.0))), 0, 255).astype(np.uint8)
+        rgb[~valid, 0] = NODATA_CODE
+        rgb[~valid, 1] = 0
+    elif product == "energy":
+        v = np.clip(np.rint(mean * (65534.0 / ENERGY_MAX)), 0, 65534).astype(np.uint16)
+        v[~valid] = NODATA_CODE_16
+        rgb[..., 0] = v >> 8
+        rgb[..., 1] = v & 0xFF
+        rgb[..., 2] = np.clip(np.rint(std * (255.0 / (ENERGY_MAX / 2.0))), 0, 255).astype(np.uint8)
+        rgb[~valid, 2] = 0
+    else:
+        raise ValueError(f"unknown product {product!r}")
     buf = io.BytesIO()
     Image.fromarray(rgb, mode="RGB").save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
 
-def _write_tileset(conn: tile_db.TileDb, field: np.ndarray, fine: _Grid, area, crs, scale: float) -> int:
+def _write_tileset(conn: tile_db.TileDb, field: np.ndarray, fine: _Grid, area, crs, product: str) -> int:
     """Whole pyramid MAX_ZOOM..MIN_ZOOM for one (month, product). Holds the
     covered tile range in memory at once - fine for a compute area of a few km
     (a 2 km area is ~8x8 z16 tiles); full-source mode will need als_normals'
@@ -1060,7 +1089,7 @@ def _write_tileset(conn: tile_db.TileDb, field: np.ndarray, fine: _Grid, area, c
                 sl = (slice(j * TILE_SIZE, (j + 1) * TILE_SIZE), slice(i * TILE_SIZE, (i + 1) * TILE_SIZE))
                 if not (count[sl] > 0).any():
                     continue
-                conn.save_tile(z, tx0 + i, ty0 + j, _encode_tile(count[sl], s1[sl], s2[sl], scale))
+                conn.save_tile(z, tx0 + i, ty0 + j, _encode_tile(count[sl], s1[sl], s2[sl], product))
                 written += 1
     conn.commit()
     return written
@@ -1160,9 +1189,9 @@ def _generate(months: list[str]) -> None:
                         m, max_e, ENERGY_MAX,
                     )
                 written = 0
-                for product, field, scale in (("hours", hours[i], HOURS_MAX), ("energy", energy[i], ENERGY_MAX)):
+                for product, field in (("hours", hours[i]), ("energy", energy[i])):
                     conn = _replace_db(m, product)
-                    written += _write_tileset(conn, field, fine, area, src.crs, scale)
+                    written += _write_tileset(conn, field, fine, area, src.crs, product)
 
                 meta = {
                     "month": m,

@@ -340,7 +340,7 @@ def check_tiles(fine, hours) -> None:
     shifted = se._Grid(fine.heights, ORIGIN_3035[0], ORIGIN_3035[1], fine.res)
     with tempfile.TemporaryDirectory() as d:
         conn = tile_db.TileDb(os.path.join(d, "t.db"))
-        n = se._write_tileset(conn, hours[0], shifted, AREA, "EPSG:3035", se.HOURS_MAX)
+        n = se._write_tileset(conn, hours[0], shifted, AREA, "EPSG:3035", "hours")
         z_counts = {}
         rows = conn._conn.execute("SELECT z, x, y, data FROM tiles").fetchall()
         decoded_means = []
