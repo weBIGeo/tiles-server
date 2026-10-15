@@ -19,13 +19,20 @@
 # Surface-normal tiles from a BEV ALS height raster.
 #
 # Deliberately agnostic to what the source actually is: it processes whatever
-# single GeoTIFF TILE_SOURCE points at, DTM or DSM, one tileset per source
+# single raster TILE_SOURCE points at, DTM or DSM, one tileset per source
 # file. There is no product parameter anywhere - point TILE_SOURCE at the other
 # file and you get the other tileset, in its own db (DB_PATH is derived from the
 # source filename, so the two can never end up mixed in one file).
 #
-# Pipeline per tile: EPSG:3035 source -> reproject to the EPSG:3857 tile grid
-# (+1px apron) -> Web Mercator altitude correction -> 3x3 gradient -> ENU normal
+# The intended source is the all-Austria EPSG:3857 mosaic built by
+# scripts/build_als_mosaic.py (docs/als_mosaic.md): it already sits on the exact
+# MAX_ZOOM tile grid, so a block is a plain window read. Any other raster (e.g. a
+# single EPSG:3035 BEV tile) still works - it is warped per block instead.
+# REGION_* optionally limits generation to a square around a point; wherever the
+# source has no data (not downloaded yet, outside Austria) blocks are skipped.
+#
+# Pipeline per tile: source -> EPSG:3857 tile grid (window read, or reproject;
+# +1px apron) -> Web Mercator altitude correction -> 3x3 gradient -> ENU normal
 # -> hemi-octahedral 8:8 in R/G of an RGBA PNG, B = Toksvig roughness factor,
 # A = snow steepness visibility (util/encoding.py, spec in
 # docs/normal_map_encoding.md) -> SQLite via util/tile_db.py.
@@ -52,6 +59,7 @@ import time
 import numpy as np
 import rasterio
 import rasterio.warp
+import rasterio.windows
 from PIL import Image
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
@@ -63,9 +71,19 @@ from tile_creators import progress
 
 logger = logging.getLogger(__name__)
 
-# The single source raster this tileset is built from. A BEV ALS DTM or DSM
-# GeoTIFF: 1 m/px, EPSG:3035, 50x50 km per tile (see scripts/fetch_bev_als.py).
-TILE_SOURCE = r"data\als_tiles\DSM\ALS_DSM_CRS3035RES50000mN2650000E4500000.tif"
+# The single source raster this tileset is built from: the int32-cm EPSG:3857
+# z17 mosaic VRT from scripts/build_als_mosaic.py (DTM or DSM). A single BEV ALS
+# GeoTIFF (1 m/px, EPSG:3035, scripts/fetch_bev_als.py) works too, just slower.
+TILE_SOURCE = r"data\als_mosaic\DTM\3857_z17\austria_DTM_3857_z17.vrt"
+
+# Optional region: only BLOCK_ZOOM blocks intersecting a square of
+# 2 * REGION_HALF_SIZE_M (ground metres) around REGION_CENTER_LATLON are
+# generated - rounded outwards to whole blocks (~3.3 km at z13). Set
+# REGION_CENTER_LATLON = None to cover everything the source holds. Parts of the
+# region without source data are simply skipped, so the region may extend past
+# what has been downloaded / mosaicked so far.
+REGION_CENTER_LATLON = (47.07455, 12.69388)  # Großglockner summit (WGS84)
+REGION_HALF_SIZE_M = 20_000  # -> 40 x 40 km
 
 TILES_DIR = "data/als_normal_tiles"
 # One db per source file, named after it, so switching TILE_SOURCE between the
@@ -88,7 +106,9 @@ PROCESS_LABEL = "ALS normals ({name})"
 # normal field by ~28%, and two honest gradient estimators disagree by 0.77 deg
 # mean on it. Left at 17 here because that is the configuration the notebook
 # actually validated; flipping it is this one line, but flip RESAMPLING with it
-# (see below) since z16 turns the reprojection into a downsample.
+# (see below) since z16 turns the reprojection into a downsample - and the z17
+# mosaic is then no longer on the MAX_ZOOM grid, so it would be warped per block
+# instead of window-read (correct, just slower) unless a z16 mosaic is built.
 MAX_ZOOM = 17 #17
 MIN_ZOOM = 0
 
@@ -120,7 +140,9 @@ APRON = 1
 # justifies the 8-bit encoding (see docs/normal_map_encoding.md).
 NORMAL_METHOD = "sobel"
 
-# Resampling used to warp the source onto the tile grid. bilinear is right while
+# Resampling used to warp the source onto the tile grid - only for a source that
+# isn't already on the MAX_ZOOM grid (the mosaic was warped with this same
+# setting by scripts/build_als_mosaic.py). bilinear is right while
 # MAX_ZOOM oversamples the 1 m source (z17 = ~0.80 m/px ground). At z16 or lower
 # the warp becomes a *downsample* and this should become Resampling.average,
 # which is what actually averages the extra source samples away instead of
@@ -185,11 +207,11 @@ def source_name() -> str:
 
 
 def source_bounds() -> tuple[float, float, float, float] | None:
-    """(west, south, east, north) WGS84 bounds of TILE_SOURCE, or None if it
-    can't be read. Cached after the first call - /v1/als-normals/status is
-    polled, and this exists so a client can jump to the coverage instead of
-    hunting for it (one 50 km source tile is a small target on a world map).
-    Densified because the EPSG:3035 footprint's edges curve in EPSG:4326."""
+    """(west, south, east, north) WGS84 bounds of what is being generated - the
+    REGION_* square if set, else TILE_SOURCE's extent - or None if it can't be
+    read. Cached after the first call - /v1/als-normals/status is polled, and
+    this exists so a client can jump to the coverage instead of hunting for it.
+    Densified because a non-3857 footprint's edges curve in EPSG:4326."""
     global _source_bounds, _source_bounds_read
     with _lock:
         if _source_bounds_read:
@@ -197,11 +219,15 @@ def source_bounds() -> tuple[float, float, float, float] | None:
 
     bounds = None
     try:
-        with rasterio.open(TILE_SOURCE) as src:
-            if src.crs is not None:
-                bounds = rasterio.warp.transform_bounds(
-                    src.crs, "EPSG:4326", *src.bounds, densify_pts=21
-                )
+        region = _region_bounds_3857()
+        if region is not None:
+            bounds = rasterio.warp.transform_bounds("EPSG:3857", "EPSG:4326", *region)
+        else:
+            with rasterio.open(TILE_SOURCE) as src:
+                if src.crs is not None:
+                    bounds = rasterio.warp.transform_bounds(
+                        src.crs, "EPSG:4326", *src.bounds, densify_pts=21
+                    )
     except Exception:
         logger.warning("als-normals: could not read bounds of %s", TILE_SOURCE, exc_info=True)
 
@@ -292,6 +318,37 @@ def _point_to_tile_3857(x: float, y: float, z: int) -> tuple[int, int]:
     return max(0, min(n - 1, tx)), max(0, min(n - 1, ty))
 
 
+def _on_tile_grid(src: rasterio.DatasetReader) -> bool:
+    """True if src is EPSG:3857 with exactly MAX_ZOOM pixels, aligned to the
+    tile grid - i.e. a block can be read without any resampling."""
+    if src.crs is None or src.crs.to_epsg() != 3857:
+        return False
+    px = WEB_MERCATOR_RES_ZOOM0 / 2 ** MAX_ZOOM
+    t = src.transform
+    if t.b != 0 or t.d != 0 or abs(t.a - px) > 1e-9 * px or abs(t.e + px) > 1e-9 * px:
+        return False
+    col, row = (t.c + WEBMERCATOR_ORIGIN) / px, (WEBMERCATOR_ORIGIN - t.f) / px
+    return abs(col - round(col)) < 1e-6 and abs(row - round(row)) < 1e-6
+
+
+def _region_bounds_3857() -> tuple[float, float, float, float] | None:
+    """REGION_* as (left, bottom, right, top) EPSG:3857 meters, or None. Web
+    Mercator inflates ground distances by 1/cos(lat), so the ground half-size is
+    scaled by that at the centre - the variation across 40 km is ~0.3%."""
+    if REGION_CENTER_LATLON is None:
+        return None
+    lat, lon = REGION_CENTER_LATLON
+    x = EARTH_RADIUS * math.radians(lon)
+    y = EARTH_RADIUS * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+    half = REGION_HALF_SIZE_M / math.cos(math.radians(lat))
+    return x - half, y - half, x + half, y + half
+
+
+def _in_region(bx: int, by: int, region: tuple[float, float, float, float]) -> bool:
+    left, bottom, right, top = _tile_bounds_3857(BLOCK_ZOOM, bx, by)
+    return left < region[2] and right > region[0] and bottom < region[3] and top > region[1]
+
+
 def _covered_blocks(src: rasterio.DatasetReader) -> list[tuple[int, int]]:
     """Every BLOCK_ZOOM tile that could hold source data, derived from the
     raster's own bounds rather than a hardcoded bbox.
@@ -331,28 +388,42 @@ def _read_block_heights(src: rasterio.DatasetReader, bx: int, by: int) -> np.nda
     NaN rather than 0 for voids matters: a zero would read as sea level and
     fabricate a cliff along every coverage border.
 
-    Note this warps the block properly instead of taking cosmos_snow's
-    windowed-resample shortcut - across 50 km the EPSG:3035 -> EPSG:3857 skew is
-    far too large to approximate with an axis-aligned window read."""
+    A source already on the MAX_ZOOM tile grid (the build_als_mosaic.py mosaic)
+    is window-read as-is. Anything else is warped properly instead of taking
+    cosmos_snow's windowed-resample shortcut - across 50 km the EPSG:3035 ->
+    EPSG:3857 skew is far too large to approximate with an axis-aligned read."""
     left, bottom, right, top = _tile_bounds_3857(BLOCK_ZOOM, bx, by)
     px = (right - left) / BLOCK_PX
     apron_bounds = (left - px * APRON, bottom - px * APRON, right + px * APRON, top + px * APRON)
-    dst_transform = from_bounds(*apron_bounds, APRON_PX, APRON_PX)
+    nodata = SOURCE_NODATA if SOURCE_NODATA is not None else src.nodata
 
-    # init_dest_nodata defaults to True, so anything the warp never touches
-    # (i.e. outside the source footprint) keeps dst_nodata.
     dst = np.full((APRON_PX, APRON_PX), np.nan, dtype=np.float32)
-    rasterio.warp.reproject(
-        source=rasterio.band(src, 1),
-        destination=dst,
-        src_transform=src.transform,
-        src_crs=src.crs,
-        src_nodata=SOURCE_NODATA if SOURCE_NODATA is not None else src.nodata,
-        dst_transform=dst_transform,
-        dst_crs="EPSG:3857",
-        dst_nodata=np.nan,
-        resampling=RESAMPLING,
-    )
+    if _on_tile_grid(src):
+        # Clip the window to the raster - outside it (and in the mosaic's
+        # nodata, e.g. chunks not built yet) the block simply stays NaN.
+        col = round((apron_bounds[0] - src.transform.c) / px)
+        row = round((src.transform.f - apron_bounds[3]) / px)
+        c0, r0 = max(col, 0), max(row, 0)
+        c1, r1 = min(col + APRON_PX, src.width), min(row + APRON_PX, src.height)
+        if c0 < c1 and r0 < r1:
+            data = src.read(1, window=rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0)).astype(np.float32)
+            if nodata is not None:
+                data[data == nodata] = np.nan
+            dst[r0 - row:r1 - row, c0 - col:c1 - col] = data
+    else:
+        # init_dest_nodata defaults to True, so anything the warp never touches
+        # (i.e. outside the source footprint) keeps dst_nodata.
+        rasterio.warp.reproject(
+            source=rasterio.band(src, 1),
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=nodata,
+            dst_transform=from_bounds(*apron_bounds, APRON_PX, APRON_PX),
+            dst_crs="EPSG:3857",
+            dst_nodata=np.nan,
+            resampling=RESAMPLING,
+        )
 
     # Web Mercator inflates horizontal distances away from the equator by
     # 1/cos(lat). weBIGeo folds that into the height rather than the quad size
@@ -562,6 +633,20 @@ def _save_level(
     return done, written
 
 
+# Function to return a dictionary from a json file
+def _load_json(json_path: str):
+    with open(json_path) as f:
+        return json.load(f)
+    
+# Function to calculate all prime numbers until a given number
+def _prime_numbers_until(n):
+    """Returns a list of all prime numbers up to and including n."""
+    primes = []
+    for num in range(2, n + 1):
+        if all(num % i != 0 for i in range(2, int(num ** 0.5) + 1)):
+            primes.append(num)
+    return primes
+
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
@@ -670,8 +755,9 @@ def _generate(conn: tile_db.TileDb) -> None:
         t_start = time.monotonic()
         with rasterio.open(TILE_SOURCE) as src:
             logger.info(
-                "als-normals: source %s crs=%s nodata=%s dtype=%s shape=%s",
+                "als-normals: source %s crs=%s nodata=%s dtype=%s shape=%s, %s",
                 TILE_SOURCE, src.crs, src.nodata, src.dtypes[0], src.shape,
+                "on the tile grid (window reads)" if _on_tile_grid(src) else "warping per block",
             )
             if src.crs is None:
                 raise RuntimeError(
@@ -680,8 +766,15 @@ def _generate(conn: tile_db.TileDb) -> None:
                 )
 
             blocks = _covered_blocks(src)
+            region = _region_bounds_3857()
+            if region is not None:
+                blocks = [b for b in blocks if _in_region(*b, region)]
+                logger.info(
+                    "als-normals: limited to %.0f km square around %s (%d block(s))",
+                    2 * REGION_HALF_SIZE_M / 1000, REGION_CENTER_LATLON, len(blocks),
+                )
             if not blocks:
-                raise RuntimeError(f"als-normals: no tiles cover the source bounds of {TILE_SOURCE}")
+                raise RuntimeError(f"als-normals: no tiles cover the source bounds (and region) of {TILE_SOURCE}")
             total = _count_total(blocks)
             logger.info(
                 "als-normals: %d block(s) at z%d, %d tile(s) across z%d..z%d, %dx%d px per block",
